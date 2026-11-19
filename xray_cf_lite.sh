@@ -2262,11 +2262,27 @@ do_sub_manage() {
                     --arg sb "$new_base" --arg st "$new_token" --argjson l "$links_json" \
                     '.sub_base = $sb | .sub_token = $st | .links = $l')
                 save_state "$(ensure_state_sub_fields "$new_state")"
+                local sync_state sync_old_url sync_port synced_local_url=""
+                sync_state=$(load_state 2>/dev/null || true)
+                sync_old_url=$(echo "$sync_state" | jq -r '.local_sub_url // ""' | tr -d '\r')
+                sync_port=$(echo "$sync_state" | jq -r '.sub_serve_port // ""' | tr -d '\r')
+                if [[ -n "$sync_old_url" && -n "$sync_port" ]]; then
+                    local sync_pub="${XRAY_CF_LITE_PUBLIC_IP:-}"
+                    [[ -n "$sync_pub" ]] || sync_pub=$(get_public_ip 2>/dev/null || true)
+                    [[ -n "$sync_pub" ]] || sync_pub="<服务器公网IP>"
+                    local sync_new_url="http://${sync_pub}:${sync_port}/${new_token}/sub"
+                    if [[ "$sync_new_url" != "$sync_old_url" ]]; then
+                        save_state "$(echo "$sync_state" | jq --arg u "$sync_new_url" '.local_sub_url = $u')"
+                        synced_local_url="$sync_new_url"
+                        [[ -n "$new_token" ]] || info "密钥已清空，直连订阅将拒绝所有请求"
+                    fi
+                fi
                 if [[ "$auto_token" == "true" ]]; then
                     ok "已自动生成访问密钥: $new_token"
                     info "把这串填进 Cloudflare Worker 的 TOKEN 环境变量"
                 fi
                 ok "远程订阅服务已更新并刷新快照 (未调用 CF API)"
+                [[ -n "$synced_local_url" ]] && ok "直连订阅地址已同步: $synced_local_url"
                 print_links "$links_json"
                 ;;
             5)
