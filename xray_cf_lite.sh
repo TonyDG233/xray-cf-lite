@@ -1799,6 +1799,75 @@ write_shortcut_local() {
 # ── VPS 直连订阅服务（一键安装）─────────────────────
 _port_in_use() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 
+_port_listening() {
+    local port="$1" hex
+    if command -v ss &>/dev/null; then
+        ss -ltn 2>/dev/null | awk -v p=":$port" 'NR>1 && substr($4, length($4)-length(p)+1) == p { f=1 } END { exit !f }'
+        return
+    fi
+    hex=$(printf '%04X' "$port")
+    awk -v h=":$hex" 'NR>1 && substr($2, length($2)-length(h)+1) == h && $4 == "0A" { f=1 } END { exit !f }' /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+
+local_sub_wait_listen() {
+    local port="$1" i
+    for i in 1 2 3 4 5 6 7; do
+        _port_listening "$port" && return 0
+        sleep 0.5
+    done
+    return 1
+}
+
+local_sub_kill_strays() {
+    local pids="" pid f
+    if command -v pgrep &>/dev/null; then
+        pids=$(pgrep -f -- "$LOCAL_SUB_PY" 2>/dev/null || true)
+    else
+        for f in /proc/[0-9]*/cmdline; do
+            [[ -r "$f" ]] || continue
+            tr '\0' ' ' < "$f" 2>/dev/null | grep -qF -- "$LOCAL_SUB_PY" || continue
+            pid="${f#/proc/}"; pid="${pid%/cmdline}"
+            pids="$pids $pid"
+        done
+    fi
+    local alive=()
+    for pid in $pids; do
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        [[ "$pid" == "$$" || "$pid" == "$PPID" ]] && continue
+        kill "$pid" 2>/dev/null || true
+        alive+=("$pid")
+    done
+    [[ "${#alive[@]}" -eq 0 ]] && return 0
+    sleep 0.5
+    for pid in "${alive[@]}"; do
+        kill -0 "$pid" 2>/dev/null || continue
+        kill -9 "$pid" 2>/dev/null || true
+    done
+    return 0
+}
+
+local_sub_stop_unit() {
+    [[ "$SKIP_SERVICE" == "1" ]] && return 0
+    local unit="$SYSTEMD_DIR/$LOCAL_SUB_SERVICE.service" initf="$INITD_DIR/$LOCAL_SUB_SERVICE"
+    if [[ "$INIT_SYSTEM" == "systemd" && -f "$unit" ]]; then
+        systemctl stop "$LOCAL_SUB_SERVICE" &>/dev/null || true
+    fi
+    if [[ -f "$initf" ]]; then
+        rc-service "$LOCAL_SUB_SERVICE" stop &>/dev/null || true
+    fi
+    return 0
+}
+
+local_sub_start_unit() {
+    [[ "$SKIP_SERVICE" == "1" ]] && return 0
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        systemctl start "$LOCAL_SUB_SERVICE" &>/dev/null || true
+    else
+        rc-service "$LOCAL_SUB_SERVICE" start &>/dev/null || true
+    fi
+    return 0
+}
+
 local_sub_server_active() {
     [[ "$SKIP_SERVICE" == "1" ]] && return 1
     if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl is-active --quiet "$LOCAL_SUB_SERVICE" &>/dev/null
@@ -1859,6 +1928,9 @@ install_local_sub_server() {
 
     local port; port=$(echo "$state" | jq -r '.sub_serve_port // 18080' | tr -d '\r')
     [[ "$port" =~ ^[0-9]+$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) || port=18080
+    local_sub_stop_unit
+    local_sub_kill_strays
+    sleep 0.5
     while _port_in_use "$port"; do
         info "端口 $port 已被占用"
         local np=""; read -rp "请输入新端口 (1-65535): " np || die "已取消"
@@ -1898,9 +1970,15 @@ EOF
     fi
 
     local token; token=$(echo "$state" | jq -r '.sub_token // ""' | tr -d '\r')
+    if [[ "$SKIP_SERVICE" != "1" ]]; then
+        if ! local_sub_wait_listen "$port"; then
+            echo "服务已启动但未在端口 $port 监听，请检查: journalctl -u $LOCAL_SUB_SERVICE -n 50"
+            return 0
+        fi
+        local_sub_selfcheck "$port" "$token"
+    fi
     local pub="${XRAY_CF_LITE_PUBLIC_IP:-}"; [[ -n "$pub" ]] || pub=$(get_public_ip 2>/dev/null || true)
     [[ -n "$pub" ]] || pub="<服务器公网IP>"
-    [[ "$SKIP_SERVICE" == "1" ]] || local_sub_selfcheck "$port" "$token"
     local local_sub_url="http://${pub}:${port}/${token}/sub"
     state=$(echo "$state" | jq --arg u "$local_sub_url" '.local_sub_url = $u')
     save_state "$state"
@@ -1933,8 +2011,12 @@ change_local_sub_port() {
         info "无效端口: $np"
     done
 
+    local_sub_stop_unit
+    local_sub_kill_strays
+    sleep 0.5
     if _port_in_use "$new_port"; then
         info "端口 $new_port 已被占用，已中止（配置未修改）"
+        local_sub_start_unit
         return 0
     fi
 
