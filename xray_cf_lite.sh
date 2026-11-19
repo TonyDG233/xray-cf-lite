@@ -1,23 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ── 常量 ──────────────────────────────────────────────
+# ── 常量 ────────────────────────────────────────────────
 XRAY_CONFIG_DIR="/usr/local/etc/xray"
 XRAY_CONFIG_PATH="$XRAY_CONFIG_DIR/config.json"
 XRAY_BINARY="/usr/local/bin/xray"
-STATE_DIR="/etc/xray-cf-lite"
+STATE_DIR="${XRAY_CF_LITE_STATE_DIR:-/etc/xray-cf-lite}"
 STATE_PATH="$STATE_DIR/state.json"
 CF_ACCOUNT_PATH="$STATE_DIR/cf_account.json"
-LAST_LINKS_PATH="$(pwd)/cf_lite_last_links.txt"
+LOCAL_SUB_DIR="$STATE_DIR/local_sub"
+LOCAL_SCRIPT_PATH="$STATE_DIR/xray_cf_lite.sh"
+LAST_LINKS_PATH="${XRAY_CF_LITE_LAST_LINKS_PATH:-$(pwd)/cf_lite_last_links.txt}"
+SHORTCUT_PATH="${XRAY_CF_LITE_SHORTCUT_PATH:-/usr/local/bin/x}"
+SCRIPT_RAW_URL="${XRAY_CF_LITE_RAW_URL:-https://raw.githubusercontent.com/TonyDG233/xray-cf-lite/main/xray_cf_lite.sh}"
 
 CF_API="https://api.cloudflare.com/client/v4"
 MANAGED_PREFIX="xray-cf-lite "
 XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
-SUB_BASE="https://yx-auto.pages.dev"
+DEFAULT_SUB_BASE="https://yx-auto.pages.dev"
+
+DEFAULT_IP_URLS=(
+    "https://raw.githubusercontent.com/gshtwy/CF-DNS-Clone/refs/heads/main/wetest-cloudflare-v4.txt"
+    "https://edt-aio-nav.pages.dev/cm/ct_50.txt"
+    "https://edt-aio-nav.pages.dev/wetest/ipv4.txt"
+    "https://edt-aio-nav.pages.dev/domain/all.txt"
+)
 
 declare -A PROTO_SUFFIX=([vless]="vl" [trojan]="tr" [vmess]="vm")
 declare -A PROTO_LABEL=([vless]="VLESS" [trojan]="TROJAN" [vmess]="VMESS")
-declare -A PROTO_FLAG=([vless]="ev" [trojan]="et" [vmess]="mess")
 
 # ── 工具 ──────────────────────────────────────────────
 die()     { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
@@ -38,6 +48,198 @@ urlencode() {
             *) printf '%%%02X' "'$c" ;;
         esac
     done
+}
+
+# ── 私网/保留地址判定（供 is_safe_url 使用） ──────────
+# 返回 0 表示该主机处于私网/环回/链路本地/保留段或内部域名，应拒绝；
+# 返回 1 表示可放行。域名相关规则与 Worker 侧 cf_sub_worker.js 保持同口径。
+
+# 将 IPv6 字面量展开为 32 位小写十六进制串（无冒号）；语法非法时返回 1。
+_ipv6_expand() {
+    local ip="$1"
+    [[ "$ip" =~ ^[0-9a-f:.]+$ ]] || return 1
+
+    # 末尾内嵌点分 IPv4（如 ::ffff:127.0.0.1）先转换为两个十六进制组
+    local last="${ip##*:}" a b c d
+    if [[ "$last" == *.* ]]; then
+        [[ "$last" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+        a="${BASH_REMATCH[1]}"; b="${BASH_REMATCH[2]}"; c="${BASH_REMATCH[3]}"; d="${BASH_REMATCH[4]}"
+        (( 10#$a <= 255 && 10#$b <= 255 && 10#$c <= 255 && 10#$d <= 255 )) || return 1
+        ip="${ip%:*}:$(printf '%02x%02x' "$((10#$a))" "$((10#$b))"):$(printf '%02x%02x' "$((10#$c))" "$((10#$d))")"
+    fi
+
+    local left="" right="" i g hex=""
+    local -a larr=() rarr=()
+    if [[ "$ip" == *::* ]]; then
+        left="${ip%%::*}"
+        right="${ip#*::}"
+        [[ "$right" == *::* ]] && return 1
+    else
+        left="$ip"
+    fi
+    [[ -n "$left" ]] && IFS=':' read -r -a larr <<< "$left"
+    [[ -n "$right" ]] && IFS=':' read -r -a rarr <<< "$right"
+
+    if [[ "$ip" == *::* ]]; then
+        (( ${#larr[@]} + ${#rarr[@]} < 8 )) || return 1
+        for ((i = ${#larr[@]} + ${#rarr[@]}; i < 8; i++)); do larr+=("0"); done
+        if (( ${#rarr[@]} > 0 )); then larr+=("${rarr[@]}"); fi
+    else
+        (( ${#larr[@]} == 8 )) || return 1
+    fi
+
+    for g in "${larr[@]}"; do
+        [[ "$g" =~ ^[0-9a-f]{1,4}$ ]] || return 1
+        hex+=$(printf '%04x' "$((16#$g))")
+    done
+    printf '%s' "$hex"
+}
+
+# IPv4 私网/环回/链路本地/保留段判定。
+_ipv4_is_private_or_reserved() {
+    local ip="$1"
+    [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    local o1=$((10#${BASH_REMATCH[1]})) o2=$((10#${BASH_REMATCH[2]})) o3=$((10#${BASH_REMATCH[3]}))
+    if (( o1 == 0 || o1 == 10 || o1 == 127 )); then return 0; fi              # 0/8 10/8 127/8
+    if (( o1 == 100 && o2 >= 64 && o2 <= 127 )); then return 0; fi            # 100.64/10
+    if (( o1 == 169 && o2 == 254 )); then return 0; fi                        # 169.254/16
+    if (( o1 == 172 && o2 >= 16 && o2 <= 31 )); then return 0; fi             # 172.16/12
+    if (( o1 == 192 && o2 == 0 && o3 == 0 )); then return 0; fi               # 192.0.0/24
+    if (( o1 == 192 && o2 == 0 && o3 == 2 )); then return 0; fi               # 192.0.2/24
+    if (( o1 == 192 && o2 == 168 )); then return 0; fi                        # 192.168/16
+    if (( o1 == 198 && (o2 == 18 || o2 == 19) )); then return 0; fi           # 198.18/15
+    if (( o1 == 198 && o2 == 51 && o3 == 100 )); then return 0; fi            # 198.51.100/24
+    if (( o1 == 203 && o2 == 0 && o3 == 113 )); then return 0; fi             # 203.0.113/24
+    if (( o1 >= 224 )); then return 0; fi                                     # 224/4 组播 + 240/4 保留
+    return 1
+}
+
+# IPv6 私网/环回/链路本地/保留段判定（基于展开后的十六进制前缀）。
+_ipv6_is_private_or_reserved() {
+    local ip="$1" hex
+    hex=$(_ipv6_expand "$ip") || return 1
+
+    # ::/96：覆盖 ::、::1 与已废弃的 IPv4-compatible 形式
+    if [[ "${hex:0:24}" == "000000000000000000000000" ]]; then return 0; fi
+    # ::ffff:0:0/96（IPv4-mapped）：展开尾部 IPv4 后按 IPv4 规则判断
+    if [[ "${hex:0:24}" == "00000000000000000000ffff" ]]; then
+        local t="${hex:24:8}"
+        _ipv4_is_private_or_reserved "$((16#${t:0:2})).$((16#${t:2:2})).$((16#${t:4:2})).$((16#${t:6:2}))"
+        return
+    fi
+    if [[ "${hex:0:24}" == "0064ff9b0000000000000000" ]]; then return 0; fi   # 64:ff9b::/96 NAT64
+    if [[ "${hex:0:2}" == "fc" || "${hex:0:2}" == "fd" ]]; then return 0; fi  # fc00::/7 ULA
+    case "${hex:0:3}" in fe8|fe9|fea|feb) return 0 ;; esac                    # fe80::/10 链路本地
+    if [[ "${hex:0:2}" == "ff" ]]; then return 0; fi                          # ff00::/8 组播
+    if [[ "${hex:0:4}" == "2002" ]]; then return 0; fi                        # 2002::/16 6to4
+    if [[ "${hex:0:8}" == "20010000" ]]; then return 0; fi                    # 2001:0::/32 Teredo
+    return 1
+}
+
+# 内部/回环别名域名判定（与 Worker 侧 BLOCKED_DOMAIN_SUFFIXES 同口径）。
+_domain_is_blocked() {
+    local h="$1" s
+    for s in localhost localtest.me lvh.me nip.io sslip.io xip.io traefik.me vcap.me lacolhost.com; do
+        if [[ "$h" == "$s" || "$h" == *".$s" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 按主机形态分发私网/保留判定；返回 0 表示应拒绝。
+is_private_or_reserved_host() {
+    local host="$1"
+    if [[ "$host" == *:* ]]; then
+        _ipv6_is_private_or_reserved "$host"
+        return
+    fi
+    if [[ "$host" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        _ipv4_is_private_or_reserved "$host"
+        return
+    fi
+    _domain_is_blocked "$host"
+}
+
+# 统一 URL 安全校验：仅允许 http/https，拒绝 shell 元字符、空白、控制字符，
+# 长度上限 2048；主机按严格白名单解析（authority -> 拒绝 userinfo -> 方括号
+# IPv6 -> 最后冒号拆 host/port -> 三形态白名单），任何非标准写法一律拒绝，
+# 且不得指向私网/环回/链路本地/保留地址或内部域名。
+is_safe_url() {
+    local url="$1"
+    (( ${#url} > 0 && ${#url} <= 2048 )) || return 1
+    [[ "$url" =~ ^https?:// ]] || return 1
+
+    # 任何可能被 shell 二次解释的字符一律拒绝
+    case "$url" in
+        *'$'*|*'`'*|*'"'*|*"'"*|*'('*|*')'*|*';'*|*'|'*|*'&'*|*'<'*|*'>'*|*'\'*|*' '*|*$'\t'*|*$'\n'*|*$'\r'*) return 1 ;;
+    esac
+
+    # 取 authority：scheme:// 之后、第一个 / ? # 之前
+    local rest="${url#*://}"
+    local authority="${rest%%[/?#]*}"
+
+    # 拒绝 userinfo：curl 会把 @ 之后当作真实主机，形成主机混淆绕过
+    [[ "$authority" == *'@'* ]] && return 1
+
+    local host="" port=""
+    if [[ "$authority" == *'['* || "$authority" == *']'* ]]; then
+        # 方括号 IPv6：必须以 [ 开头、以 ] 闭合，其后只允许 [:port]
+        [[ "$authority" == \[* ]] || return 1
+        [[ "$authority" == *']'* ]] || return 1
+        host="${authority%%]*}"
+        host="${host#[}"
+        local after="${authority#*]}"
+        if [[ -n "$after" ]]; then
+            [[ "$after" =~ ^:[0-9]{1,5}$ ]] || return 1
+            port="${after#:}"
+        fi
+    else
+        # host 本身不含 :，按最后一个 : 拆 host/port；冒号后为空视为非法
+        if [[ "$authority" == *':'* ]]; then
+            host="${authority%:*}"
+            port="${authority##*:}"
+            [[ -n "$port" ]] || return 1
+        else
+            host="$authority"
+        fi
+    fi
+
+    [[ -n "$host" ]] || return 1
+    host="${host,,}"
+
+    # 显式拒绝尾随点（不做静默剥离）
+    [[ "$host" == *'.' ]] && return 1
+
+    # 端口：若存在必须是 1..65535
+    if [[ -n "$port" ]]; then
+        [[ "$port" =~ ^[0-9]{1,5}$ ]] || return 1
+        (( 10#$port >= 1 && 10#$port <= 65535 )) || return 1
+    fi
+
+    # 形态 1：严格十进制点分四段 IPv4（每段无前导零，恰好 4 段）
+    if [[ "$host" =~ ^(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])$ ]]; then
+        is_private_or_reserved_host "$host" && return 1
+        return 0
+    fi
+
+    # 形态 2：方括号 IPv6（展开后必须恰好 32 位十六进制），再走私网判定
+    if [[ "$authority" == \[* ]]; then
+        [[ "$host" == *':'* ]] || return 1
+        local hex
+        hex=$(_ipv6_expand "$host") || return 1
+        [[ "$hex" =~ ^[0-9a-f]{32}$ ]] || return 1
+        is_private_or_reserved_host "$host" && return 1
+        return 0
+    fi
+
+    # 形态 3：域名——必须含点、至少一个字母、TLD 全字母、以字母或数字结尾
+    [[ "$host" == *'.'* ]] || return 1
+    [[ "$host" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || return 1
+    [[ "$host" =~ [a-z] ]] || return 1
+    [[ "${host##*.}" =~ ^[a-z]+$ ]] || return 1
+    is_private_or_reserved_host "$host" && return 1
+    return 0
 }
 
 gen_uuid() { cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen | tr '[:upper:]' '[:lower:]'; }
@@ -554,23 +756,349 @@ write_xray_config() {
     ok "xray 配置已写入 $XRAY_CONFIG_PATH"
 }
 
-# ── 订阅链接 ─────────────────────────────────────────
+# ── 订阅链接与状态扩展 ───────────────────────────────
+default_ip_urls_json() {
+    printf '%s\n' "${DEFAULT_IP_URLS[@]}" | jq -R . | jq -s -c .
+}
+
+state_get_sub_base() {
+    local state="${1:-}"
+    [[ -n "$state" ]] || state=$(load_state 2>/dev/null || true)
+    local val=""
+    if [[ -n "$state" ]]; then
+        val=$(echo "$state" | jq -r '.sub_base // empty' 2>/dev/null | tr -d '\r' || true)
+    fi
+    while [[ "$val" == */ ]]; do
+        val="${val%/}"
+    done
+    [[ -n "$val" ]] || val="$DEFAULT_SUB_BASE"
+    echo "$val"
+}
+
+state_get_sub_token() {
+    local state="${1:-}"
+    [[ -n "$state" ]] || state=$(load_state 2>/dev/null || true)
+    local val=""
+    if [[ -n "$state" ]]; then
+        val=$(echo "$state" | jq -r '.sub_token // ""' 2>/dev/null | tr -d '\r' || true)
+    fi
+    echo "$val"
+}
+
+state_get_port_mode() {
+    local state="${1:-}"
+    [[ -n "$state" ]] || state=$(load_state 2>/dev/null || true)
+    local val=""
+    if [[ -n "$state" ]]; then
+        val=$(echo "$state" | jq -r '.port_mode // "all_tls"' 2>/dev/null | tr -d '\r' || true)
+    fi
+    case "$val" in
+        all_tls|only_443) echo "$val" ;;
+        *) echo "all_tls" ;;
+    esac
+}
+
+state_get_ip_urls_json() {
+    local state="${1:-}"
+    [[ -n "$state" ]] || state=$(load_state 2>/dev/null || true)
+    if [[ -n "$state" ]] && echo "$state" | jq -e '(.ip_urls | type == "array") and ((.ip_urls | length) > 0)' &>/dev/null; then
+        echo "$state" | jq -c '.ip_urls'
+        return
+    fi
+    default_ip_urls_json
+}
+
+ensure_state_sub_fields() {
+    local st_json="$1"
+    local def_ipu
+    def_ipu=$(default_ip_urls_json)
+    echo "$st_json" | jq --arg dsb "$DEFAULT_SUB_BASE" --argjson dipu "$def_ipu" '
+        .sub_base = (if (.sub_base // "") != "" then (.sub_base | sub("/+$"; "")) else $dsb end) |
+        .sub_token = (.sub_token // "") |
+        .port_mode = (if (.port_mode == "only_443" or .port_mode == "all_tls") then .port_mode else "all_tls" end) |
+        .ip_urls = (if (.ip_urls | type == "array") and ((.ip_urls | length) > 0) then .ip_urls else $dipu end)
+    '
+}
+
 build_link() {
     local uid="$1" domain="$2" proto="$3" path="$4"
+    local sub_base="${5:-}"
+    [[ -n "$sub_base" ]] || sub_base=$(state_get_sub_base)
+    while [[ "$sub_base" == */ ]]; do
+        sub_base="${sub_base%/}"
+    done
+    [[ -n "$sub_base" ]] || sub_base="$DEFAULT_SUB_BASE"
+    local sub_token
+    if [[ $# -ge 6 ]]; then
+        sub_token="$6"
+    else
+        sub_token=$(state_get_sub_token)
+    fi
     local ev="no" et="no" evm="no"
     case "$proto" in vless) ev="yes";; trojan) et="yes";; vmess) evm="yes";; esac
-    echo "${SUB_BASE}/${uid}/sub?domain=${domain}&epd=yes&epi=yes&egi=no&dkby=yes&ev=${ev}&et=${et}&mess=${evm}&path=$(urlencode "$path")"
+    local url="${sub_base}/${uid}/sub?domain=${domain}&epd=yes&epi=yes&egi=no&dkby=yes&ev=${ev}&et=${et}&mess=${evm}&path=$(urlencode "$path")"
+    if [[ -n "$sub_token" ]]; then
+        url="${url}&token=$(urlencode "$sub_token")"
+    fi
+    echo "$url"
 }
 
 gen_all_links() {
     local uid="$1" domain="$2" routes_json="$3"
+    local sub_base="${4:-}"
+    [[ -n "$sub_base" ]] || sub_base=$(state_get_sub_base)
+    local sub_token
+    if [[ $# -ge 5 ]]; then
+        sub_token="$5"
+    else
+        sub_token=$(state_get_sub_token)
+    fi
     local links_json='{}'
     local proto path link
     while IFS=$'\t' read -r proto path; do
-        link=$(build_link "$uid" "$domain" "$proto" "$path")
+        link=$(build_link "$uid" "$domain" "$proto" "$path" "$sub_base" "$sub_token")
         links_json=$(echo "$links_json" | jq --arg p "$proto" --arg l "$link" '. + {($p):$l}')
-    done < <(echo "$routes_json" | jq -r '.[] | [.protocol, .path] | @tsv')
+    done < <(echo "$routes_json" | jq -r '.[] | [.protocol, .path] | @tsv' | tr -d '\r')
     echo "$links_json"
+}
+
+# ── 本地优选 IP 拉取与订阅生成 ────────────────────────
+is_valid_preferred_host() {
+    local h="$1"
+    if [[ "$h" =~ ^\[([0-9a-fA-F:]+)\]$ ]]; then
+        local inner="${BASH_REMATCH[1]}"
+        [[ "$inner" == *:* ]] && return 0
+        return 1
+    fi
+    if [[ "$h" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+        local o1="${BASH_REMATCH[1]}" o2="${BASH_REMATCH[2]}" o3="${BASH_REMATCH[3]}" o4="${BASH_REMATCH[4]}"
+        (( 10#$o1 <= 255 && 10#$o2 <= 255 && 10#$o3 <= 255 && 10#$o4 <= 255 )) && return 0
+        return 1
+    fi
+    if [[ "$h" == *.* && "$h" != *..* && "$h" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]]; then
+        [[ "$h" =~ [a-zA-Z] ]] && return 0
+    fi
+    return 1
+}
+
+fetch_and_clean_preferred_ips() {
+    local state="${1:-}"
+    [[ -n "$state" ]] || state=$(load_state 2>/dev/null || true)
+    [[ -n "$state" ]] || die "未检测到部署"
+
+    local domain port_mode ip_urls_json
+    domain=$(echo "$state" | jq -r '.domain // ""' | tr -d '\r')
+    [[ -n "$domain" ]] || die "state.json 缺少 domain 字段"
+    port_mode=$(state_get_port_mode "$state")
+    ip_urls_json=$(state_get_ip_urls_json "$state")
+
+    declare -A seen_endpoint=()
+    printf '%s\t%s\t%s\n' "$domain" "443" "原生地址-${domain}"
+    seen_endpoint["${domain,,}:443"]=1
+
+    local urls=() url
+    mapfile -t urls < <(echo "$ip_urls_json" | jq -r '.[]' | tr -d '\r')
+
+    for url in "${urls[@]}"; do
+        [[ -n "$url" ]] || continue
+        local content=""
+        if ! content=$(curl -fsSL --connect-timeout 6 --max-time 15 "$url" 2>/dev/null); then
+            info "警告: 拉取失败 $url (已跳过)"
+            continue
+        fi
+
+        local line
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            line="${line//$'\r'/}"
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            [[ -z "$line" ]] && continue
+            [[ "$line" == \#* || "$line" == //* ]] && continue
+
+            local addr_part="$line" raw_remark=""
+            if [[ "$line" == *#* ]]; then
+                addr_part="${line%%#*}"
+                raw_remark="${line#*#}"
+            fi
+            addr_part="${addr_part#"${addr_part%%[![:space:]]*}"}"
+            addr_part="${addr_part%"${addr_part##*[![:space:]]}"}"
+            raw_remark="${raw_remark#"${raw_remark%%[![:space:]]*}"}"
+            raw_remark="${raw_remark%"${raw_remark##*[![:space:]]}"}"
+
+            [[ -z "$addr_part" ]] && continue
+            [[ "$addr_part" == *"://"* ]] && continue
+            if [[ "$raw_remark" == *"▼"* || "$raw_remark" == *"▲"* || "$raw_remark" == *"分享优选网"* || "$raw_remark" == *"分享免费优选网"* ]]; then
+                continue
+            fi
+
+            if [[ "$addr_part" == *,* ]]; then
+                addr_part="${addr_part%%,*}"
+                addr_part="${addr_part%"${addr_part##*[![:space:]]}"}"
+                [[ -z "$addr_part" ]] && continue
+            fi
+
+            local host="" port="443"
+            if [[ "$addr_part" =~ ^\[([0-9a-fA-F:]+)\]:([0-9]+)$ ]]; then
+                host="[${BASH_REMATCH[1]}]"
+                port="${BASH_REMATCH[2]}"
+            elif [[ "$addr_part" =~ ^\[([0-9a-fA-F:]+)\]$ ]]; then
+                host="[${BASH_REMATCH[1]}]"
+                port="443"
+            elif [[ "$addr_part" == \[* ]]; then
+                continue
+            elif [[ "$addr_part" =~ ^([^:]+):([0-9]+)$ ]]; then
+                host="${BASH_REMATCH[1]}"
+                port="${BASH_REMATCH[2]}"
+            elif [[ "$addr_part" == *:* ]]; then
+                continue
+            else
+                host="$addr_part"
+                port="443"
+            fi
+
+            is_valid_preferred_host "$host" || continue
+
+            if [[ "$port_mode" == "only_443" ]]; then
+                [[ "$port" == "443" ]] || continue
+            else
+                case "$port" in
+                    443|2053|2083|2087|2096|8443) ;;
+                    *) continue ;;
+                esac
+            fi
+
+            local ep_key="${host,,}:${port}"
+            [[ -n "${seen_endpoint[$ep_key]:-}" ]] && continue
+            seen_endpoint["$ep_key"]=1
+
+            raw_remark="${raw_remark//$'\t'/ }"
+            raw_remark=$(printf '%s' "$raw_remark" | tr -d '\000-\037\177')
+            [[ -n "$raw_remark" ]] || raw_remark="${host}:${port}"
+
+            printf '%s\t%s\t%s\n' "$host" "$port" "$raw_remark"
+        done < <(printf '%s' "$content")
+    done
+}
+
+generate_local_subscriptions() {
+    local state
+    state=$(load_state 2>/dev/null || true)
+    [[ -n "$state" ]] || die "未检测到部署"
+
+    local domain uid routes_json port_mode
+    domain=$(echo "$state" | jq -r '.domain // ""' | tr -d '\r')
+    uid=$(echo "$state" | jq -r '.uuid // ""' | tr -d '\r')
+    routes_json=$(echo "$state" | jq -c '.routes // []' | tr -d '\r')
+    port_mode=$(state_get_port_mode "$state")
+    [[ -n "$domain" && -n "$uid" ]] || die "state.json 缺少 domain 或 uuid"
+
+    info "正在拉取并清洗优选 IP（端口策略: $port_mode）..."
+    local cleaned_tsv
+    cleaned_tsv=$(fetch_and_clean_preferred_ips "$state")
+    local endpoint_count
+    endpoint_count=$(printf '%s\n' "$cleaned_tsv" | grep -c . || true)
+
+    mkdir -p "$STATE_DIR" "$LOCAL_SUB_DIR"
+    chmod 700 "$STATE_DIR" "$LOCAL_SUB_DIR"
+    rm -f "$LOCAL_SUB_DIR"/nodes_*.txt "$LOCAL_SUB_DIR"/sub_*_base64.txt
+    : > "$LOCAL_SUB_DIR/nodes_all.txt"
+
+    local proto_rows=() row enabled_protos=()
+    mapfile -t proto_rows < <(echo "$routes_json" | jq -r '.[] | [.protocol, .path] | @tsv' | tr -d '\r')
+    [[ ${#proto_rows[@]} -gt 0 ]] || die "未找到已启用协议配置"
+
+    for row in "${proto_rows[@]}"; do
+        local proto="${row%%$'\t'*}"
+        local path="${row#*$'\t'}"
+        local proto_nodes_file="$LOCAL_SUB_DIR/nodes_${proto}.txt"
+        local proto_b64_file="$LOCAL_SUB_DIR/sub_${proto}_base64.txt"
+
+        printf '%s\n' "$cleaned_tsv" | jq -R -s -r \
+            --arg uid "$uid" --arg domain "$domain" --arg path "$path" --arg proto "$proto" '
+            split("\n")
+            | map(select(length > 0) | split("\t"))
+            | .[]
+            | .[0] as $uri_host
+            | (.[0] | sub("^\\["; "") | sub("\\]$"; "")) as $raw_host
+            | .[1] as $port
+            | .[2] as $remark
+            | if $proto == "vless" then
+                "vless://" + $uid + "@" + $uri_host + ":" + $port
+                + "?encryption=none&security=tls&sni=" + ($domain | @uri)
+                + "&fp=chrome&type=ws&host=" + ($domain | @uri)
+                + "&path=" + ($path | @uri) + "#" + ($remark | @uri)
+              elif $proto == "trojan" then
+                "trojan://" + $uid + "@" + $uri_host + ":" + $port
+                + "?security=tls&sni=" + ($domain | @uri)
+                + "&fp=chrome&type=ws&host=" + ($domain | @uri)
+                + "&path=" + ($path | @uri) + "#" + ($remark | @uri)
+              elif $proto == "vmess" then
+                "vmess://" + ({
+                    v: "2",
+                    ps: ($remark + "-VMess-WS-TLS"),
+                    add: $raw_host,
+                    port: $port,
+                    id: $uid,
+                    aid: "0",
+                    scy: "auto",
+                    net: "ws",
+                    type: "none",
+                    host: $domain,
+                    path: $path,
+                    tls: "tls",
+                    sni: $domain,
+                    fp: "chrome"
+                } | tojson | @base64)
+              else
+                empty
+              end
+        ' | tr -d '\r' > "$proto_nodes_file"
+
+        cat "$proto_nodes_file" >> "$LOCAL_SUB_DIR/nodes_all.txt"
+        jq -Rsr '@base64' < "$proto_nodes_file" | tr -d '\r' > "$proto_b64_file"
+        chmod 600 "$proto_nodes_file" "$proto_b64_file"
+        enabled_protos+=("$proto")
+    done
+
+    jq -Rsr '@base64' < "$LOCAL_SUB_DIR/nodes_all.txt" | tr -d '\r' > "$LOCAL_SUB_DIR/sub_all_base64.txt"
+    chmod 600 "$LOCAL_SUB_DIR/nodes_all.txt" "$LOCAL_SUB_DIR/sub_all_base64.txt"
+
+    local updated_at links_json new_state total_nodes
+    updated_at=$(date '+%Y-%m-%d %H:%M:%S')
+    total_nodes=$(wc -l < "$LOCAL_SUB_DIR/nodes_all.txt" | tr -d ' ')
+    links_json=$(gen_all_links "$uid" "$domain" "$routes_json" "$(state_get_sub_base "$state")" "$(state_get_sub_token "$state")")
+    save_links_snapshot "$domain" "$uid" "$links_json"
+
+    new_state=$(echo "$state" | jq \
+        --argjson cnt "$endpoint_count" \
+        --arg ts "$updated_at" \
+        --argjson l "$links_json" \
+        '.local_sub_count=$cnt | .local_sub_updated_at=$ts | .links=$l')
+    save_state "$(ensure_state_sub_fields "$new_state")"
+
+    echo
+    ok "本地优选订阅生成完成"
+    echo "  域名: $domain"
+    echo "  唯一优选地址数: $endpoint_count  (端口策略: $port_mode)"
+    echo "  启用协议: ${enabled_protos[*]}  总节点数: $total_nodes"
+    echo "  更新时间: $updated_at"
+    echo
+    echo "  汇总 Base64 订阅: $LOCAL_SUB_DIR/sub_all_base64.txt"
+    echo "  汇总原始节点:     $LOCAL_SUB_DIR/nodes_all.txt"
+    for p in "${enabled_protos[@]}"; do
+        echo "  [$p] 节点: $LOCAL_SUB_DIR/nodes_${p}.txt | Base64: $LOCAL_SUB_DIR/sub_${p}_base64.txt"
+    done
+    echo
+    echo "原始节点预览 (前 5 条):"
+    head -n 5 "$LOCAL_SUB_DIR/nodes_all.txt" | sed 's/^/  /'
+    if [[ "$total_nodes" -gt 5 ]]; then
+        echo "  ... 共 $total_nodes 条，完整列表见 $LOCAL_SUB_DIR/nodes_all.txt"
+    fi
+    echo
+    echo "── 一键复制 Base64 订阅 (sub_all_base64.txt) ──"
+    cat "$LOCAL_SUB_DIR/sub_all_base64.txt"
+    echo
+    echo "────────────────────────────────────────────────"
 }
 
 # ── 状态 ──────────────────────────────────────────────
@@ -580,9 +1108,10 @@ remove_state() { rm -f "$STATE_PATH"; }
 
 save_links_snapshot() {
     local domain="$1" uid="$2" links_json="$3"
+    mkdir -p "$(dirname "$LAST_LINKS_PATH")"
     { echo "域名: $domain"; echo "UUID: $uid"; echo
       echo "$links_json" | jq -r 'to_entries[] | "\(.key) \(.value)"'
-    } > "$LAST_LINKS_PATH"
+    } | tr -d '\r' > "$LAST_LINKS_PATH"
     chmod 600 "$LAST_LINKS_PATH"
 }
 
@@ -769,8 +1298,10 @@ do_install() {
     security_backup=$(cf_relax_security "$zone_id")
 
     # 订阅
+    local init_sub_base="$DEFAULT_SUB_BASE" init_sub_token="" init_port_mode="all_tls" init_ip_urls
+    init_ip_urls=$(default_ip_urls_json)
     local links_json
-    links_json=$(gen_all_links "$uid" "$domain" "$routes_json")
+    links_json=$(gen_all_links "$uid" "$domain" "$routes_json" "$init_sub_base" "$init_sub_token")
     save_links_snapshot "$domain" "$uid" "$links_json"
 
     # 状态
@@ -789,9 +1320,11 @@ do_install() {
         --arg drid "$dns_record_id" --argjson dex "$dns_existed" --argjson drec "$dns_before" \
         --arg ssl "$ssl_before" --argjson orbk "$origin_rules_before" --argjson links "$links_json" \
         --argjson secbk "$security_backup" \
+        --arg sb "$init_sub_base" --arg st "$init_sub_token" --arg pm "$init_port_mode" --argjson ipu "$init_ip_urls" \
         '{domain:$d,zone_id:$z,uuid:$u,short_id:$s,net_mode:$mode,routes:$routes,
           managed_dns_record_id:$drid,dns_backup:{existed:$dex,record:$drec},
-          ssl_backup:$ssl,origin_rules_backup:$orbk,security_backup:$secbk,links:$links}')"
+          ssl_backup:$ssl,origin_rules_backup:$orbk,security_backup:$secbk,links:$links,
+          sub_base:$sb,sub_token:$st,port_mode:$pm,ip_urls:$ipu}')"
 
     echo
     ok "部署完成"
@@ -842,18 +1375,41 @@ do_uninstall() {
 
     remove_state
     rm -f "$LAST_LINKS_PATH" "$CF_ACCOUNT_PATH"
-    ok "已清理订阅快照与 CF 凭据"
+    rm -rf "$LOCAL_SUB_DIR"
+    rm -f "$LOCAL_SCRIPT_PATH"
+    ok "已清理订阅快照、本地优选订阅、CF 凭据与本地离线脚本"
     ok "卸载完成"
 }
 
 # ── 3. 查看订阅 ──────────────────────────────────────
 do_show() {
-    if [[ -f "$LAST_LINKS_PATH" ]]; then cat "$LAST_LINKS_PATH"; return; fi
     local state; state=$(load_state 2>/dev/null || true)
-    [[ -n "$state" ]] || die "无历史订阅"
-    echo "域名: $(echo "$state" | jq -r '.domain')"
-    echo "UUID: $(echo "$state" | jq -r '.uuid')"
-    echo "$state" | jq -r '.links | to_entries[] | "\(.key) \(.value)"'
+    if [[ -n "$state" ]]; then
+        local domain uid links_json
+        domain=$(echo "$state" | jq -r '.domain // ""' | tr -d '\r')
+        uid=$(echo "$state" | jq -r '.uuid // ""' | tr -d '\r')
+        links_json=$(echo "$state" | jq '.links // {}' | tr -d '\r')
+        if [[ -f "$LAST_LINKS_PATH" ]]; then
+            save_links_snapshot "$domain" "$uid" "$links_json"
+        fi
+        echo "域名: $domain"
+        echo "UUID: $uid"
+        echo "$links_json" | jq -r 'to_entries[] | "\(.key) \(.value)"'
+        if [[ -f "$LOCAL_SUB_DIR/sub_all_base64.txt" ]]; then
+            local sub_cnt sub_time
+            sub_cnt=$(echo "$state" | jq -r '.local_sub_count // 0' | tr -d '\r')
+            sub_time=$(echo "$state" | jq -r '.local_sub_updated_at // "未知"' | tr -d '\r')
+            echo
+            echo "本地优选订阅:"
+            echo "  优选地址数: $sub_cnt  更新时间: $sub_time"
+            echo "  Base64 订阅文件: $LOCAL_SUB_DIR/sub_all_base64.txt"
+            echo "  原始节点文件:    $LOCAL_SUB_DIR/nodes_all.txt"
+            echo "  快速导出: cat $LOCAL_SUB_DIR/sub_all_base64.txt"
+        fi
+        return
+    fi
+    if [[ -f "$LAST_LINKS_PATH" ]]; then cat "$LAST_LINKS_PATH"; return; fi
+    die "无历史订阅"
 }
 
 # ── 4. 修改配置 ──────────────────────────────────────
@@ -950,10 +1506,12 @@ do_modify() {
         ok "Origin Rules 已更新"
     fi
 
-    local links_json; links_json=$(gen_all_links "$new_uid" "$domain" "$new_routes")
+    local links_json; links_json=$(gen_all_links "$new_uid" "$domain" "$new_routes" "$(state_get_sub_base "$state")" "$(state_get_sub_token "$state")")
     save_links_snapshot "$domain" "$new_uid" "$links_json"
-    save_state "$(echo "$state" | jq --arg u "$new_uid" --argjson r "$new_routes" --argjson l "$links_json" --arg s "${new_uid:0:8}" \
-        '.uuid=$u|.short_id=$s|.routes=$r|.links=$l')"
+    local updated_state
+    updated_state=$(echo "$state" | jq --arg u "$new_uid" --argjson r "$new_routes" --argjson l "$links_json" --arg s "${new_uid:0:8}" \
+        '.uuid=$u|.short_id=$s|.routes=$r|.links=$l')
+    save_state "$(ensure_state_sub_fields "$updated_state")"
 
     echo; ok "配置已更新"; print_links "$links_json"
 }
@@ -962,6 +1520,13 @@ do_modify() {
 do_show_config() {
     local state; state=$(load_state 2>/dev/null || true)
     [[ -n "$state" ]] || die "未检测到部署"
+
+    local sub_base sub_token ip_count port_mode port_label
+    sub_base=$(state_get_sub_base "$state")
+    sub_token=$(state_get_sub_token "$state")
+    ip_count=$(state_get_ip_urls_json "$state" | jq 'length' | tr -d '\r')
+    port_mode=$(state_get_port_mode "$state")
+    [[ "$port_mode" == "only_443" ]] && port_label="only_443 (仅443)" || port_label="all_tls (全部CF TLS端口)"
 
     echo
     echo "域名:  $(echo "$state" | jq -r '.domain')"
@@ -973,8 +1538,26 @@ do_show_config() {
     echo
     echo -n "xray: "; svc_is_active && echo "运行中" || echo "未运行"
     echo
+    echo "远程订阅: $sub_base${sub_token:+ (已设置token)}"
+    echo "优选配置: 优选源=${ip_count}个  端口策略=${port_label}"
+    if [[ -f "$LOCAL_SUB_DIR/sub_all_base64.txt" ]]; then
+        local lcnt ltime
+        lcnt=$(echo "$state" | jq -r '.local_sub_count // 0' | tr -d '\r')
+        ltime=$(echo "$state" | jq -r '.local_sub_updated_at // "未知"' | tr -d '\r')
+        echo "本地订阅: 已生成 (${lcnt}个优选地址, 更新于 ${ltime})"
+        echo "          $LOCAL_SUB_DIR/sub_all_base64.txt"
+    else
+        echo "本地订阅: 未生成 (可通过菜单 9 -> 1 生成)"
+    fi
+    echo
     echo "订阅:"
-    print_links "$(echo "$state" | jq '.links')"
+    local links_json
+    links_json=$(echo "$state" | jq -c '.links // {}')
+    if [[ "$(echo "$links_json" | jq 'length')" == "0" ]]; then
+        echo "  (无订阅链接，可进入菜单 9 刷新生成)"
+    else
+        print_links "$links_json"
+    fi
     echo
 }
 
@@ -1035,9 +1618,11 @@ do_update_ports() {
         fi
 
         local uid; uid=$(echo "$state" | jq -r '.uuid')
-        local links_json; links_json=$(gen_all_links "$uid" "$domain" "$new_routes")
+        local links_json; links_json=$(gen_all_links "$uid" "$domain" "$new_routes" "$(state_get_sub_base "$state")" "$(state_get_sub_token "$state")")
         save_links_snapshot "$domain" "$uid" "$links_json"
-        save_state "$(echo "$state" | jq --argjson r "$new_routes" --argjson l "$links_json" '.routes=$r|.links=$l')"
+        local updated_state
+        updated_state=$(echo "$state" | jq --argjson r "$new_routes" --argjson l "$links_json" '.routes=$r|.links=$l')
+        save_state "$(ensure_state_sub_fields "$updated_state")"
 
         echo; ok "外部端口已更新"; print_links "$links_json"
     else
@@ -1104,10 +1689,12 @@ do_switch_net_mode() {
     apply_origin_rules "$zone_id" "$domain" "$new_routes"
     ok "Origin Rules 已更新"
 
-    local links_json; links_json=$(gen_all_links "$uid" "$domain" "$new_routes")
+    local links_json; links_json=$(gen_all_links "$uid" "$domain" "$new_routes" "$(state_get_sub_base "$state")" "$(state_get_sub_token "$state")")
     save_links_snapshot "$domain" "$uid" "$links_json"
-    save_state "$(echo "$state" | jq --arg m "$target" --argjson r "$new_routes" --argjson l "$links_json" \
-        '.net_mode=$m | .routes=$r | .links=$l')"
+    local updated_state
+    updated_state=$(echo "$state" | jq --arg m "$target" --argjson r "$new_routes" --argjson l "$links_json" \
+        '.net_mode=$m | .routes=$r | .links=$l')
+    save_state "$(ensure_state_sub_fields "$updated_state")"
 
     echo; ok "已切换到 $(net_mode_label "$target")"; print_links "$links_json"
 }
@@ -1121,14 +1708,302 @@ do_restart() {
     restart_xray
 }
 
+# ── 9. 订阅与优选 IP 管理（免 CF Key）─────────────────
+write_shortcut_remote() {
+    local url="$1"
+    if ! is_safe_url "$url"; then
+        info "拒绝写入不安全的脚本 URL: $url"
+        return 1
+    fi
+    mkdir -p "$(dirname "$SHORTCUT_PATH")"
+    local qurl
+    qurl=$(printf '%q' "$url")
+    {
+        printf '#!/bin/sh\n'
+        printf 'exec bash <(curl -fsSL %s) "$@"\n' "$qurl"
+    } > "$SHORTCUT_PATH"
+    chmod +x "$SHORTCUT_PATH"
+    ok "快捷命令已更新 ($SHORTCUT_PATH -> $url)"
+}
+
+write_shortcut_local() {
+    mkdir -p "$STATE_DIR" "$(dirname "$SHORTCUT_PATH")"
+    chmod 700 "$STATE_DIR"
+    local src="${BASH_SOURCE[0]:-}"
+    if [[ -n "$src" && -f "$src" && "$src" != /dev/fd/* && "$src" != /proc/self/fd/* ]]; then
+        cp "$src" "$LOCAL_SCRIPT_PATH"
+    else
+        if ! is_safe_url "$SCRIPT_RAW_URL"; then
+            info "拒绝拉取不安全的脚本 URL: $SCRIPT_RAW_URL"
+            return 1
+        fi
+        curl -fsSL "$SCRIPT_RAW_URL" -o "$LOCAL_SCRIPT_PATH" || { info "拉取离线副本失败: $SCRIPT_RAW_URL"; return 1; }
+    fi
+    bash -n "$LOCAL_SCRIPT_PATH" || { info "脚本语法校验失败，已中止固化"; return 1; }
+    chmod 700 "$LOCAL_SCRIPT_PATH"
+    local qpath
+    qpath=$(printf '%q' "$LOCAL_SCRIPT_PATH")
+    {
+        printf '#!/bin/sh\n'
+        printf 'exec bash %s "$@"\n' "$qpath"
+    } > "$SHORTCUT_PATH"
+    chmod +x "$SHORTCUT_PATH"
+    ok "已固化为本地离线脚本 ($SHORTCUT_PATH -> $LOCAL_SCRIPT_PATH)"
+}
+
+do_sub_manage() {
+    while true; do
+        local state=""
+        state=$(load_state 2>/dev/null || true)
+        local sub_base sub_token ip_urls_json ip_count port_mode port_label
+        sub_base=$(state_get_sub_base "$state")
+        sub_token=$(state_get_sub_token "$state")
+        ip_urls_json=$(state_get_ip_urls_json "$state")
+        ip_count=$(echo "$ip_urls_json" | jq 'length' | tr -d '\r')
+        port_mode=$(state_get_port_mode "$state")
+        [[ "$port_mode" == "only_443" ]] && port_label="仅保留 443 端口" || port_label="全部 CF TLS 端口 (443/2053/2083/2087/2096/8443)"
+
+        echo
+        echo "── 订阅与优选 IP 管理 (免 CF Key) ──────────────"
+        echo "  远程订阅服务: $sub_base${sub_token:+ (已设置密钥)}"
+        echo "  优选 IP 源:   ${ip_count} 个"
+        echo "  端口策略:     $port_label"
+        if [[ -n "$state" && -f "$LOCAL_SUB_DIR/sub_all_base64.txt" ]]; then
+            local lcnt ltime
+            lcnt=$(echo "$state" | jq -r '.local_sub_count // 0' | tr -d '\r')
+            ltime=$(echo "$state" | jq -r '.local_sub_updated_at // "未知"' | tr -d '\r')
+            echo "  本地订阅:     ${lcnt} 个优选地址 (更新于 ${ltime})"
+        fi
+        echo
+        echo "  1. 立即拉取优选 IP 并生成本地订阅"
+        echo "  2. 管理优选 IP 列表链接"
+        echo "  3. 切换优选端口过滤策略"
+        echo "  4. 更换远程订阅服务 URL 与密钥"
+        echo "  5. 固化/更新快捷命令 x"
+        echo "  0. 返回主菜单"
+        echo
+
+        local sub_choice=""
+        read -rp "请选择 [0-5]: " sub_choice || break
+        case "$sub_choice" in
+            1)
+                if [[ -z "$state" ]]; then
+                    info "未检测到已部署节点，请先在主菜单执行 [1. 安装节点]"
+                    continue
+                fi
+                generate_local_subscriptions
+                ;;
+            2)
+                if [[ -z "$state" ]]; then
+                    info "未检测到已部署节点，请先在主菜单执行 [1. 安装节点]"
+                    continue
+                fi
+                echo
+                echo "当前优选 IP 列表链接:"
+                echo "$ip_urls_json" | jq -r 'to_entries[] | "  \(.key + 1). \(.value)"'
+                echo
+                local act=""
+                read -rp "操作 (a=添加, d=删除, r=恢复默认4个源, 0=返回): " act || continue
+                case "${act,,}" in
+                    a)
+                        local raw_input=""
+                        read -rp "输入优选源 URL (支持空格或逗号分隔多个): " raw_input || continue
+                        raw_input="${raw_input//,/ }"
+                        local add_arr=() u added=0 updated_urls="$ip_urls_json"
+                        read -ra add_arr <<< "$raw_input"
+                        for u in "${add_arr[@]}"; do
+                            [[ -n "$u" ]] || continue
+                            if ! is_safe_url "$u"; then
+                                info "跳过无效或不安全的 URL: $u"
+                                continue
+                            fi
+                            if echo "$updated_urls" | jq -e --arg u "$u" 'index($u) != null' &>/dev/null; then
+                                info "已存在，跳过: $u"
+                                continue
+                            fi
+                            updated_urls=$(echo "$updated_urls" | jq -c --arg u "$u" '. + [$u]')
+                            added=$((added + 1))
+                        done
+                        if [[ $added -gt 0 ]]; then
+                            local new_state
+                            new_state=$(echo "$state" | jq --argjson ipu "$updated_urls" '.ip_urls = $ipu')
+                            save_state "$(ensure_state_sub_fields "$new_state")"
+                            ok "已添加 $added 个优选源"
+                        else
+                            info "未添加任何有效 URL"
+                        fi
+                        ;;
+                    d)
+                        local del_idx=""
+                        read -rp "输入要删除的序号 [1-$ip_count]: " del_idx || continue
+                        if [[ ! "$del_idx" =~ ^[0-9]+$ ]] || (( del_idx < 1 || del_idx > ip_count )); then
+                            info "无效序号: $del_idx"
+                            continue
+                        fi
+                        if (( ip_count <= 1 )); then
+                            info "至少保留 1 个优选源（或使用 r 恢复默认）"
+                            continue
+                        fi
+                        local updated_urls new_state
+                        updated_urls=$(echo "$ip_urls_json" | jq -c --argjson idx "$((del_idx - 1))" 'del(.[$idx])')
+                        new_state=$(echo "$state" | jq --argjson ipu "$updated_urls" '.ip_urls = $ipu')
+                        save_state "$(ensure_state_sub_fields "$new_state")"
+                        ok "已删除第 $del_idx 个优选源"
+                        ;;
+                    r)
+                        local def_urls new_state
+                        def_urls=$(default_ip_urls_json)
+                        new_state=$(echo "$state" | jq --argjson ipu "$def_urls" '.ip_urls = $ipu')
+                        save_state "$(ensure_state_sub_fields "$new_state")"
+                        ok "已恢复默认 4 个优选源"
+                        ;;
+                    0|"") ;;
+                    *) info "未知操作: $act" ;;
+                esac
+                ;;
+            3)
+                if [[ -z "$state" ]]; then
+                    info "未检测到已部署节点，请先在主菜单执行 [1. 安装节点]"
+                    continue
+                fi
+                echo
+                echo "当前策略: $port_label ($port_mode)"
+                echo "  1. 全部 CF TLS 端口 (443/2053/2083/2087/2096/8443)"
+                echo "  2. 仅保留 443 端口"
+                echo "  0. 取消"
+                local pm_choice="" new_pm=""
+                read -rp "请选择 [0-2]: " pm_choice || continue
+                case "$pm_choice" in
+                    1) new_pm="all_tls" ;;
+                    2) new_pm="only_443" ;;
+                    0|"") continue ;;
+                    *) info "无效选项: $pm_choice"; continue ;;
+                esac
+                local new_state
+                new_state=$(echo "$state" | jq --arg pm "$new_pm" '.port_mode = $pm')
+                save_state "$(ensure_state_sub_fields "$new_state")"
+                ok "端口过滤策略已切换为: $new_pm"
+                ;;
+            4)
+                if [[ -z "$state" ]]; then
+                    info "未检测到已部署节点，请先在主菜单执行 [1. 安装节点]"
+                    continue
+                fi
+                echo
+                echo "当前远程订阅服务: $sub_base"
+                if [[ -n "$sub_token" ]]; then
+                    echo "当前访问密钥:     已设置"
+                else
+                    echo "当前访问密钥:     (未设置)"
+                fi
+                local raw_base="" new_base="$sub_base"
+                read -rp "新的订阅服务 URL (留空=保持当前, 输入 default=恢复默认): " raw_base || continue
+                if [[ -n "$raw_base" ]]; then
+                    if [[ "${raw_base,,}" == "default" ]]; then
+                        new_base="$DEFAULT_SUB_BASE"
+                    else
+                        while [[ "$raw_base" == */ ]]; do
+                            raw_base="${raw_base%/}"
+                        done
+                        if [[ ! "$raw_base" =~ ^https?://[^[:space:]]+$ ]]; then
+                            info "无效的 URL（需以 http:// 或 https:// 开头）: $raw_base"
+                            continue
+                        fi
+                        new_base="$raw_base"
+                    fi
+                fi
+                local raw_token="" new_token="$sub_token" auto_token="false"
+                read -rp "访问密钥 token (输入 auto=自动生成, 回车=保持当前, -=清空): " raw_token || continue
+                if [[ "$raw_token" == "-" ]]; then
+                    new_token=""
+                elif [[ "$raw_token" == "auto" ]]; then
+                    new_token=$(gen_uuid | tr -d '-')
+                    auto_token="true"
+                elif [[ -n "$raw_token" ]]; then
+                    new_token="$raw_token"
+                fi
+
+                local domain uid routes_json links_json new_state
+                domain=$(echo "$state" | jq -r '.domain' | tr -d '\r')
+                uid=$(echo "$state" | jq -r '.uuid' | tr -d '\r')
+                routes_json=$(echo "$state" | jq -c '.routes' | tr -d '\r')
+                links_json=$(gen_all_links "$uid" "$domain" "$routes_json" "$new_base" "$new_token")
+                save_links_snapshot "$domain" "$uid" "$links_json"
+                new_state=$(echo "$state" | jq \
+                    --arg sb "$new_base" --arg st "$new_token" --argjson l "$links_json" \
+                    '.sub_base = $sb | .sub_token = $st | .links = $l')
+                save_state "$(ensure_state_sub_fields "$new_state")"
+                if [[ "$auto_token" == "true" ]]; then
+                    ok "已自动生成访问密钥: $new_token"
+                    info "把这串填进 Cloudflare Worker 的 TOKEN 环境变量"
+                fi
+                ok "远程订阅服务已更新并刷新快照 (未调用 CF API)"
+                print_links "$links_json"
+                ;;
+            5)
+                echo
+                if [[ -f "$SHORTCUT_PATH" ]]; then
+                    echo "当前快捷命令 ($SHORTCUT_PATH):"
+                    sed 's/^/  /' "$SHORTCUT_PATH"
+                    echo
+                fi
+                echo "  1. 指向当前 Fork 仓库远程地址 ($SCRIPT_RAW_URL)"
+                echo "  2. 固化为本地离线脚本 ($LOCAL_SCRIPT_PATH)"
+                echo "  3. 自定义其他远程脚本 Raw URL"
+                echo "  0. 返回"
+                local sc_choice=""
+                read -rp "请选择 [0-3]: " sc_choice || continue
+                case "$sc_choice" in
+                    1) write_shortcut_remote "$SCRIPT_RAW_URL" ;;
+                    2) write_shortcut_local ;;
+                    3)
+                        local custom_url=""
+                        read -rp "输入自定义脚本 Raw URL: " custom_url || continue
+                        if ! is_safe_url "$custom_url"; then
+                            info "无效或不安全的 URL: $custom_url"
+                            continue
+                        fi
+                        write_shortcut_remote "$custom_url"
+                        ;;
+                    0|"") ;;
+                    *) info "无效选项: $sc_choice" ;;
+                esac
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                info "无效选项: $sub_choice"
+                ;;
+        esac
+    done
+}
+
 # ── 主入口 ────────────────────────────────────────────
 ensure_shortcut() {
-    local target="/usr/local/bin/x"
-    [[ -f "$target" ]] && return
-    cat > "$target" << 'SCEOF'
-#!/bin/sh
-exec bash <(curl -fsSL https://raw.githubusercontent.com/byJoey/xray-cf-lite/main/xray_cf_lite.sh) "$@"
-SCEOF
+    local target="$SHORTCUT_PATH"
+    mkdir -p "$(dirname "$target")"
+    if ! is_safe_url "$SCRIPT_RAW_URL"; then
+        info "忽略不安全的 SCRIPT_RAW_URL，未更新快捷命令: $SCRIPT_RAW_URL"
+        return 0
+    fi
+    local qurl
+    qurl=$(printf '%q' "$SCRIPT_RAW_URL")
+    if [[ -f "$target" ]]; then
+        if grep -q "byJoey/xray-cf-lite" "$target" 2>/dev/null; then
+            {
+                printf '#!/bin/sh\n'
+                printf 'exec bash <(curl -fsSL %s) "$@"\n' "$qurl"
+            } > "$target"
+            chmod +x "$target"
+            info "已将快捷命令 x 自动迁移至当前仓库源"
+        fi
+        return
+    fi
+    {
+        printf '#!/bin/sh\n'
+        printf 'exec bash <(curl -fsSL %s) "$@"\n' "$qurl"
+    } > "$target"
     chmod +x "$target"
 }
 
@@ -1146,8 +2021,18 @@ main() {
         net_mode=$(echo "$state" | jq -r '.net_mode // ""')
     fi
 
+    local ip_count port_mode port_label
+    ip_count=$(state_get_ip_urls_json "$state" | jq 'length' | tr -d '\r')
+    port_mode=$(state_get_port_mode "$state")
+    [[ "$port_mode" == "only_443" ]] && port_label="仅443" || port_label="全部TLS端口"
+
     echo
     echo "  xray-cf-lite ($INIT_SYSTEM)"
+    if [[ -n "$current_domain" ]]; then
+        echo "  当前: $current_domain${net_mode:+ [$net_mode]} | 优选源: ${ip_count}个 | 端口策略: $port_label"
+    else
+        echo "  优选源: ${ip_count}个 | 端口策略: $port_label"
+    fi
     echo
     echo "  1. 安装节点"
     echo "  2. 卸载"
@@ -1157,16 +2042,20 @@ main() {
     echo "  6. 更新外部端口(NAT换端口)"
     echo "  7. 重启 xray"
     echo "  8. 切换网络模式(直连/NAT)"
-    [[ -n "$current_domain" ]] && echo "     (当前: $current_domain${net_mode:+ [$net_mode]})"
+    echo "  9. 订阅与优选 IP 管理(免CF Key)"
+    echo "  0. 退出"
     echo
 
-    read -rp "请选择 [1-8]: " choice
+    read -rp "请选择 [0-9]: " choice
     case "$choice" in
         1) do_install ;; 2) do_uninstall ;; 3) do_show ;;
         4) do_modify ;; 5) do_show_config ;; 6) do_update_ports ;;
-        7) do_restart ;; 8) do_switch_net_mode ;;
+        7) do_restart ;; 8) do_switch_net_mode ;; 9) do_sub_manage ;;
+        0) exit 0 ;;
         *) die "无效选项: $choice" ;;
     esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
+    main "$@"
+fi
