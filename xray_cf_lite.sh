@@ -1818,6 +1818,22 @@ local_sub_cleanup() {
     rm -f "$unit" "$initf" "$LOCAL_SUB_PY"
 }
 
+local_sub_selfcheck() {
+    local port="$1" token="$2" attempt hit=0
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        if curl -fsS --max-time 2 "http://127.0.0.1:${port}/${token}/sub" -o /dev/null 2>/dev/null; then
+            hit=1
+            break
+        fi
+        [[ "$attempt" -lt 10 ]] && sleep 0.5
+    done
+    if [[ "$hit" == "1" ]]; then
+        echo "订阅服务自检通过"
+    else
+        echo "服务已启动，但本机自检未通过（可能仍在启动中）。若持续失败请查看: journalctl -u $LOCAL_SUB_SERVICE -n 50"
+    fi
+}
+
 install_local_sub_server() {
     if ! command -v python3 &>/dev/null; then
         info "未检测到 python3，尝试自动安装..."
@@ -1884,12 +1900,85 @@ EOF
     local token; token=$(echo "$state" | jq -r '.sub_token // ""' | tr -d '\r')
     local pub="${XRAY_CF_LITE_PUBLIC_IP:-}"; [[ -n "$pub" ]] || pub=$(get_public_ip 2>/dev/null || true)
     [[ -n "$pub" ]] || pub="<服务器公网IP>"
-    [[ "$SKIP_SERVICE" == "1" ]] || { curl -fsS --max-time 5 "http://127.0.0.1:${port}/${token}/sub" -o /dev/null 2>/dev/null && ok "本机自检通过" || info "服务已写入但本机自检失败，请查看 journalctl -u $LOCAL_SUB_SERVICE"; }
+    [[ "$SKIP_SERVICE" == "1" ]] || local_sub_selfcheck "$port" "$token"
     local local_sub_url="http://${pub}:${port}/${token}/sub"
     state=$(echo "$state" | jq --arg u "$local_sub_url" '.local_sub_url = $u')
     save_state "$state"
     echo "订阅服务已启动"
     echo "订阅地址: $local_sub_url"
+    info "若客户端连不上，请确认云安全组与本机防火墙已放行该端口"
+}
+
+change_local_sub_port() {
+    local state; state=$(load_state 2>/dev/null || true)
+    local unit="$SYSTEMD_DIR/$LOCAL_SUB_SERVICE.service" initf="$INITD_DIR/$LOCAL_SUB_SERVICE"
+    local cur_url=""
+    [[ -n "$state" ]] && cur_url=$(echo "$state" | jq -r '.local_sub_url // ""' | tr -d '\r')
+    if [[ -z "$state" || -z "$cur_url" || ( ! -f "$unit" && ! -f "$initf" ) ]]; then
+        info "请先执行 6 安装直连订阅服务"
+        return 0
+    fi
+
+    local cur_port; cur_port=$(echo "$state" | jq -r '.sub_serve_port // 18080' | tr -d '\r')
+    [[ "$cur_port" =~ ^[0-9]+$ ]] && (( 10#$cur_port >= 1 && 10#$cur_port <= 65535 )) || cur_port=18080
+    echo "当前直连订阅端口: $cur_port"
+
+    local np="" new_port=""
+    while true; do
+        read -rp "请输入新端口 (1-65535): " np || { info "已取消"; return 0; }
+        if [[ "$np" =~ ^[0-9]+$ ]] && (( 10#$np >= 1 && 10#$np <= 65535 )); then
+            new_port=$((10#$np))
+            break
+        fi
+        info "无效端口: $np"
+    done
+
+    if _port_in_use "$new_port"; then
+        info "端口 $new_port 已被占用，已中止（配置未修改）"
+        return 0
+    fi
+
+    state=$(echo "$state" | jq --argjson p "$new_port" '.sub_serve_port = $p'); save_state "$state"
+
+    local pybin; pybin=$(command -v python3)
+    [[ -n "$pybin" ]] || die "缺少 python3，请先安装后重试"
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        mkdir -p "$SYSTEMD_DIR"
+        cat > "$unit" <<EOF
+[Unit]
+Description=xray-cf-lite local subscription server
+After=network.target
+[Service]
+ExecStart=$pybin $LOCAL_SUB_PY --port $new_port --state $STATE_PATH
+Restart=always
+RestartSec=2
+[Install]
+WantedBy=multi-user.target
+EOF
+        [[ "$SKIP_SERVICE" == "1" ]] || { systemctl daemon-reload; systemctl restart "$LOCAL_SUB_SERVICE"; }
+    else
+        mkdir -p "$INITD_DIR"
+        cat > "$initf" <<EOF
+#!/sbin/openrc-run
+name="$LOCAL_SUB_SERVICE"
+command="$pybin"
+command_args="$LOCAL_SUB_PY --port $new_port --state $STATE_PATH"
+supervisor="supervise-daemon"
+respawn_delay=2
+respawn_max=0
+EOF
+        chmod +x "$initf"
+        [[ "$SKIP_SERVICE" == "1" ]] || rc-service "$LOCAL_SUB_SERVICE" restart
+    fi
+
+    local token; token=$(echo "$state" | jq -r '.sub_token // ""' | tr -d '\r')
+    local pub="${XRAY_CF_LITE_PUBLIC_IP:-}"; [[ -n "$pub" ]] || pub=$(get_public_ip 2>/dev/null || true)
+    [[ -n "$pub" ]] || pub="<服务器公网IP>"
+    local local_sub_url="http://${pub}:${new_port}/${token}/sub"
+    state=$(echo "$state" | jq --arg u "$local_sub_url" '.local_sub_url = $u'); save_state "$state"
+    echo "端口已更新为: $new_port"
+    echo "订阅地址: $local_sub_url"
+    [[ "$SKIP_SERVICE" == "1" ]] || local_sub_selfcheck "$new_port" "$token"
     info "若客户端连不上，请确认云安全组与本机防火墙已放行该端口"
 }
 
@@ -1933,11 +2022,12 @@ do_sub_manage() {
         echo "  4. 更换远程订阅服务 URL 与密钥"
         echo "  5. 固化/更新快捷命令 x"
         echo "  6. 安装/更新直连订阅服务"
+        echo "  7. 更换直连订阅端口"
         echo "  0. 返回主菜单"
         echo
 
         local sub_choice=""
-        read -rp "请选择 [0-6]: " sub_choice || break
+        read -rp "请选择 [0-7]: " sub_choice || break
         case "$sub_choice" in
             1)
                 if [[ -z "$state" ]]; then
@@ -2128,6 +2218,9 @@ do_sub_manage() {
                 ;;
             6)
                 install_local_sub_server
+                ;;
+            7)
+                change_local_sub_port
                 ;;
             0)
                 return 0
