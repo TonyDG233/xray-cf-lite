@@ -1,0 +1,12 @@
+[Unit]
+Description=xray-cf-lite VPS local subscription
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /root/local_sub_server.py --port 18080
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

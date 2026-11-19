@@ -820,6 +820,17 @@ ensure_state_sub_fields() {
     '
 }
 
+ensure_sub_token_present() {
+    local state="$1" token
+    [[ -n "$state" ]] || return 0
+    token=$(echo "$state" | jq -r '.sub_token // ""' 2>/dev/null | tr -d '\r')
+    [[ -n "$token" ]] && return 0
+    token=$(gen_uuid | tr -d '-')
+    state=$(echo "$state" | jq --arg t "$token" '.sub_token = $t')
+    save_state "$state"
+    info "已自动生成订阅密钥: $token"
+}
+
 build_link() {
     local uid="$1" domain="$2" proto="$3" path="$4"
     local sub_base="${5:-}"
@@ -836,7 +847,11 @@ build_link() {
     fi
     local ev="no" et="no" evm="no"
     case "$proto" in vless) ev="yes";; trojan) et="yes";; vmess) evm="yes";; esac
-    local url="${sub_base}/${uid}/sub?domain=${domain}&epd=yes&epi=yes&egi=no&dkby=yes&ev=${ev}&et=${et}&mess=${evm}&path=$(urlencode "$path")"
+    local port_mode ip_urls ip_param=""
+    port_mode=$(state_get_port_mode)
+    ip_urls=$(load_state 2>/dev/null | jq -r '(.ip_urls // []) | join(",")' 2>/dev/null | tr -d '\r' || true)
+    [[ -n "$ip_urls" ]] && ip_param="&ip_urls=$(urlencode "$ip_urls")"
+    local url="${sub_base}/${uid}/sub?domain=${domain}&ev=${ev}&et=${et}&mess=${evm}&path=$(urlencode "$path")&port_mode=${port_mode}${ip_param}"
     if [[ -n "$sub_token" ]]; then
         url="${url}&token=$(urlencode "$sub_token")"
     fi
@@ -1121,6 +1136,21 @@ print_links() {
     while IFS=$'\t' read -r proto link; do
         echo "  ${PROTO_LABEL[$proto]:-$proto}订阅 $link"
     done < <(echo "$links_json" | jq -r 'to_entries[] | [.key, .value] | @tsv')
+}
+
+refresh_links_after_sub_change() {
+    local state="$1"
+    [[ -n "$state" ]] || return 0
+    local domain uid routes_json links_json
+    domain=$(echo "$state" | jq -r '.domain // empty' 2>/dev/null | tr -d '\r' || true)
+    uid=$(echo "$state" | jq -r '.uuid // empty' 2>/dev/null | tr -d '\r' || true)
+    routes_json=$(echo "$state" | jq -c '.routes // []' 2>/dev/null | tr -d '\r' || true)
+    [[ -n "$domain" && -n "$uid" ]] || return 0
+    links_json=$(gen_all_links "$uid" "$domain" "$routes_json" "$(state_get_sub_base "$state")" "$(state_get_sub_token "$state")")
+    save_links_snapshot "$domain" "$uid" "$links_json"
+    save_state "$(echo "$state" | jq --argjson l "$links_json" '.links=$l')"
+    print_links "$links_json"
+    echo "若使用 CF Worker 订阅，请将新链接更新至客户端；若使用 VPS 直连订阅则无需更换链接"
 }
 
 # ── 交互辅助 ─────────────────────────────────────────
@@ -1521,6 +1551,9 @@ do_show_config() {
     local state; state=$(load_state 2>/dev/null || true)
     [[ -n "$state" ]] || die "未检测到部署"
 
+    ensure_sub_token_present "$state"
+    state=$(load_state 2>/dev/null || true)
+
     local sub_base sub_token ip_count port_mode port_label
     sub_base=$(state_get_sub_base "$state")
     sub_token=$(state_get_sub_token "$state")
@@ -1538,7 +1571,8 @@ do_show_config() {
     echo
     echo -n "xray: "; svc_is_active && echo "运行中" || echo "未运行"
     echo
-    echo "远程订阅: $sub_base${sub_token:+ (已设置token)}"
+    echo "远程订阅: $sub_base"
+    echo "访问密钥: ${sub_token:-(未设置)}"
     echo "优选配置: 优选源=${ip_count}个  端口策略=${port_label}"
     if [[ -f "$LOCAL_SUB_DIR/sub_all_base64.txt" ]]; then
         local lcnt ltime
@@ -1829,6 +1863,7 @@ do_sub_manage() {
                             new_state=$(echo "$state" | jq --argjson ipu "$updated_urls" '.ip_urls = $ipu')
                             save_state "$(ensure_state_sub_fields "$new_state")"
                             ok "已添加 $added 个优选源"
+                            refresh_links_after_sub_change "$(load_state 2>/dev/null || true)"
                         else
                             info "未添加任何有效 URL"
                         fi
@@ -1849,6 +1884,7 @@ do_sub_manage() {
                         new_state=$(echo "$state" | jq --argjson ipu "$updated_urls" '.ip_urls = $ipu')
                         save_state "$(ensure_state_sub_fields "$new_state")"
                         ok "已删除第 $del_idx 个优选源"
+                        refresh_links_after_sub_change "$(load_state 2>/dev/null || true)"
                         ;;
                     r)
                         local def_urls new_state
@@ -1856,6 +1892,7 @@ do_sub_manage() {
                         new_state=$(echo "$state" | jq --argjson ipu "$def_urls" '.ip_urls = $ipu')
                         save_state "$(ensure_state_sub_fields "$new_state")"
                         ok "已恢复默认 4 个优选源"
+                        refresh_links_after_sub_change "$(load_state 2>/dev/null || true)"
                         ;;
                     0|"") ;;
                     *) info "未知操作: $act" ;;
@@ -1883,6 +1920,7 @@ do_sub_manage() {
                 new_state=$(echo "$state" | jq --arg pm "$new_pm" '.port_mode = $pm')
                 save_state "$(ensure_state_sub_fields "$new_state")"
                 ok "端口过滤策略已切换为: $new_pm"
+                refresh_links_after_sub_change "$(load_state 2>/dev/null || true)"
                 ;;
             4)
                 if [[ -z "$state" ]]; then
@@ -2019,6 +2057,7 @@ main() {
     if [[ -n "$state" ]]; then
         current_domain=$(echo "$state" | jq -r '.domain // ""')
         net_mode=$(echo "$state" | jq -r '.net_mode // ""')
+        ensure_sub_token_present "$state"
     fi
 
     local ip_count port_mode port_label

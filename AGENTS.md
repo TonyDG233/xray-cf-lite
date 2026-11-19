@@ -45,16 +45,17 @@
 
 ## 订阅链接契约
 
-`<sub_base>/<uuid>/sub?domain=<domain>&epd=yes&epi=yes&egi=no&dkby=yes&ev=<yes|no>&et=<yes|no>&mess=<yes|no>&path=<urlencoded>[&token=<urlencoded>]`
+`<sub_base>/<uuid>/sub?domain=<domain>&ev=<yes|no>&et=<yes|no>&mess=<yes|no>&path=<urlencoded>&port_mode=<all_tls|only_443>[&ip_urls=<urlencoded 逗号分隔>][&token=<urlencoded>]`
 
-`epd/epi/egi/dkby` 为历史遗留参数，Worker 忽略。
+`epd/epi/egi/dkby` 已不再生成。
+`ip_urls` 仅在鉴权通过后生效，覆盖 Worker 默认源；`port_mode` 查询参数优先于环境变量。
 节点模板：统一 TLS + WS，`sni`/`host` = 域名，端口来自优选源；VMess 的 `add` 不带 IPv6 方括号。
 
 ## Worker 说明
 
 - 路由 `/<uid>/sub`；`/`、`/health`、`/favicon.ico` 返回固定文本且不得泄露 `TOKEN`
 - 鉴权：`Authorization: Bearer <TOKEN>` 或 `?token=`，恒定时间比较
-- 源列表只来自 `DEFAULT_IP_URLS` 或 `env.IP_URLS`，**不接受查询参数注入**
+- 源列表默认来自 `DEFAULT_IP_URLS` 或 `env.IP_URLS`；鉴权通过后可由 `?ip_urls=` 覆盖（仅 https、过 `isSafeSourceUrl`、去重、上限 32 条）
 - `redirect: "manual"`，每跳复检，最多 3 跳
 - 拒绝私网/环回/链路本地/保留地址与回环别名域名
 - 单源响应体上限 2 MiB；`Promise.allSettled` 单源失败不影响其余
@@ -72,3 +73,8 @@
 - `README.md` 只写用户视角：装什么、跑什么、看到什么。禁止出现函数名、内部参数名、第三方源 URL、状态字段名
 - 技术细节一律写入本文件
 - 新增功能先更新本文件，再决定 README 是否需要一句话提及
+
+## VPS 直连订阅
+- `local_sub_server.py`：仅标准库、每请求重读 state.json；默认端口 18080；token 取 state.sub_token，缺省用 `--token` / `LOCAL_SUB_TOKEN`
+- 端点按源列表元组缓存，TTL 300s，端口过滤在渲染时执行；`local_sub_server.service.example` 为 systemd 模板
+- Worker 的 `?ip_urls=` 在鉴权通过后生效（仅 https、过 `isSafeSourceUrl`、上限 32），非空时覆盖 env.IP_URLS 与默认源

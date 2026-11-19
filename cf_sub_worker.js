@@ -553,10 +553,13 @@ function collectEndpoints(text, portMode, seen, output) {
 }
 
 /**
- * 汇总要拉取的源：只信任部署者配置的环境变量 IP_URLS（非空时覆盖默认源）。
- * 为防 SSRF，不接受通过查询参数注入额外源。
+ * 汇总要拉取的源：鉴权通过后传入的 ?ip_urls= 非空时覆盖默认源，
+ * 否则回退环境变量 IP_URLS，最后回退 DEFAULT_IP_URLS。
  */
-function buildSourceList(env) {
+function buildSourceList(env, querySources) {
+  if (Array.isArray(querySources) && querySources.length > 0) {
+    return querySources.slice(0, MAX_IP_SOURCES);
+  }
   const envSources = splitList(env.IP_URLS).filter(isHttpUrl);
   const list = envSources.length > 0 ? envSources.slice() : DEFAULT_IP_URLS.slice();
   return Array.from(new Set(list)).slice(0, MAX_IP_SOURCES);
@@ -709,6 +712,14 @@ async function handleRequest(request, env) {
     return respond(request, "forbidden", 403);
   }
 
+  // 鉴权通过后才解析 ?ip_urls=，仅接受 https 且通过安全校验的源，去重后最多 32 条
+  const querySources = Array.from(
+    new Set(
+      splitList(url.searchParams.get("ip_urls"))
+        .filter((item) => item.startsWith("https://") && isSafeSourceUrl(item))
+    )
+  );
+
   // uid 基本校验：8-64 位，仅字母、数字、连字符
   let uid = "";
   try {
@@ -781,7 +792,7 @@ async function handleRequest(request, env) {
   });
 
   // 并发拉取所有源；单源失败 / 超时只跳过，不影响整体
-  const sources = buildSourceList(env);
+  const sources = buildSourceList(env, querySources);
   if (sources.length > 0) {
     const results = await Promise.allSettled(
       sources.map((sourceUrl) => fetchSource(sourceUrl, FETCH_TIMEOUT_MS))
