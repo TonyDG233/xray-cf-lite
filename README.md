@@ -84,9 +84,20 @@ x
 
 ## 可选：用 Cloudflare Worker 做订阅
 
-1. 登录 Cloudflare 后台，新建一个 Worker，把仓库里的 `cf_sub_worker.js` 全部粘贴进去并部署。
-2. 运行 `x` 进 `9` → `4`，填上 Worker 地址，密钥输入 `auto` 生成一串。
-3. 回 Cloudflare 给这个 Worker 添加名为 `TOKEN` 的变量，值填刚才那串，重新部署。
+需要在 Cloudflare 后台操作，适合想让订阅走自己域名的情况。
+
+1. 打开 Cloudflare Dashboard -> Workers & Pages -> Create -> Worker，随便起个名字（如 `cflite-sub`），点 Deploy
+2. 点 Edit code，删掉编辑器里的默认代码，粘贴仓库中 `cf_sub_worker.js` 的全部内容，点 Deploy
+3. 记下页面上的地址，形如 `https://cflite-sub.你的子域.workers.dev`
+4. 回服务器运行 `x`，进 `9` -> `4`：
+   - 订阅服务 URL 填第 3 步的地址
+   - 访问密钥输入 `auto`，脚本会自动生成一串并打印出来，记下它
+5. 回 Cloudflare，进这个 Worker 的 Settings -> Variables and Secrets，添加变量 `TOKEN`，值填第 4 步打印的那串，保存后重新 Deploy
+
+完成后，把脚本打印的订阅链接贴进客户端（安装时选三个协议就是三条），之后点「更新订阅」即可拿到最新优选 IP。
+
+> 未设置 `TOKEN` 时订阅地址对公网开放，任何人拿到都能用，建议按第 5 步设置。
+> 若 `workers.dev` 在你所在网络打不开，可给 Worker 绑定自己的域名，或在客户端开启「通过代理更新订阅」。
 
 ## 手动导入节点
 
