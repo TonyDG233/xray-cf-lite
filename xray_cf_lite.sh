@@ -1421,22 +1421,25 @@ do_uninstall() {
 do_show() {
     local state; state=$(load_state 2>/dev/null || true)
     if [[ -n "$state" ]]; then
-        local domain uid links_json
+        local domain uid links_json local_sub_url
         domain=$(echo "$state" | jq -r '.domain // ""' | tr -d '\r')
         uid=$(echo "$state" | jq -r '.uuid // ""' | tr -d '\r')
         links_json=$(echo "$state" | jq '.links // {}' | tr -d '\r')
+        local_sub_url=$(echo "$state" | jq -r '.local_sub_url // ""' | tr -d '\r')
         if [[ -f "$LAST_LINKS_PATH" ]]; then
             save_links_snapshot "$domain" "$uid" "$links_json"
         fi
         echo "域名: $domain"
         echo "UUID: $uid"
+        echo "直连订阅: ${local_sub_url:-未安装 (菜单 9 -> 6)}"
+        echo "远程订阅 (可选):"
         echo "$links_json" | jq -r 'to_entries[] | "\(.key) \(.value)"'
         if [[ -f "$LOCAL_SUB_DIR/sub_all_base64.txt" ]]; then
             local sub_cnt sub_time
             sub_cnt=$(echo "$state" | jq -r '.local_sub_count // 0' | tr -d '\r')
             sub_time=$(echo "$state" | jq -r '.local_sub_updated_at // "未知"' | tr -d '\r')
             echo
-            echo "本地优选订阅:"
+            echo "导出的节点文件:"
             echo "  优选地址数: $sub_cnt  更新时间: $sub_time"
             echo "  Base64 订阅文件: $LOCAL_SUB_DIR/sub_all_base64.txt"
             echo "  原始节点文件:    $LOCAL_SUB_DIR/nodes_all.txt"
@@ -1560,7 +1563,8 @@ do_show_config() {
     ensure_sub_token_present "$state"
     state=$(load_state 2>/dev/null || true)
 
-    local sub_base sub_token ip_count port_mode port_label
+    local sub_base sub_token ip_count port_mode port_label local_sub_url
+    local_sub_url=$(echo "$state" | jq -r '.local_sub_url // ""' | tr -d '\r')
     sub_base=$(state_get_sub_base "$state")
     sub_token=$(state_get_sub_token "$state")
     ip_count=$(state_get_ip_urls_json "$state" | jq 'length' | tr -d '\r')
@@ -1571,26 +1575,27 @@ do_show_config() {
     echo "域名:  $(echo "$state" | jq -r '.domain')"
     echo "UUID:  $(echo "$state" | jq -r '.uuid')"
     echo "模式:  $(echo "$state" | jq -r '.net_mode // "direct"')"
+    echo "直连订阅: ${local_sub_url:-未安装 (菜单 9 -> 6)}"
     echo
     echo "入站:"
     echo "$state" | jq -r '.routes[] | "  \(.protocol)  监听:\(.listen_port)  CF端口:\(.cf_port)  路径:\(.path)"'
     echo
     echo -n "xray: "; svc_is_active && echo "运行中" || echo "未运行"
     echo
-    echo "远程订阅: $sub_base"
+    echo "远程订阅 (可选): $sub_base"
     echo "访问密钥: ${sub_token:-(未设置)}"
     echo "优选配置: 优选源=${ip_count}个  端口策略=${port_label}"
     if [[ -f "$LOCAL_SUB_DIR/sub_all_base64.txt" ]]; then
         local lcnt ltime
         lcnt=$(echo "$state" | jq -r '.local_sub_count // 0' | tr -d '\r')
         ltime=$(echo "$state" | jq -r '.local_sub_updated_at // "未知"' | tr -d '\r')
-        echo "本地订阅: 已生成 (${lcnt}个优选地址, 更新于 ${ltime})"
-        echo "          $LOCAL_SUB_DIR/sub_all_base64.txt"
+        echo "导出的节点文件: 已生成 (${lcnt}个优选地址, 更新于 ${ltime})"
+        echo "                $LOCAL_SUB_DIR/sub_all_base64.txt"
     else
-        echo "本地订阅: 未生成 (可通过菜单 9 -> 1 生成)"
+        echo "导出的节点文件: 未生成 (可通过菜单 9 -> 1 生成)"
     fi
     echo
-    echo "订阅:"
+    echo "远程订阅链接:"
     local links_json
     links_json=$(echo "$state" | jq -c '.links // {}')
     if [[ "$(echo "$links_json" | jq 'length')" == "0" ]]; then
@@ -1880,8 +1885,11 @@ EOF
     local pub="${XRAY_CF_LITE_PUBLIC_IP:-}"; [[ -n "$pub" ]] || pub=$(get_public_ip 2>/dev/null || true)
     [[ -n "$pub" ]] || pub="<服务器公网IP>"
     [[ "$SKIP_SERVICE" == "1" ]] || { curl -fsS --max-time 5 "http://127.0.0.1:${port}/${token}/sub" -o /dev/null 2>/dev/null && ok "本机自检通过" || info "服务已写入但本机自检失败，请查看 journalctl -u $LOCAL_SUB_SERVICE"; }
+    local local_sub_url="http://${pub}:${port}/${token}/sub"
+    state=$(echo "$state" | jq --arg u "$local_sub_url" '.local_sub_url = $u')
+    save_state "$state"
     echo "订阅服务已启动"
-    echo "订阅地址: http://${pub}:${port}/${token}/sub"
+    echo "订阅地址: $local_sub_url"
     info "若客户端连不上，请确认云安全组与本机防火墙已放行该端口"
 }
 
@@ -1919,12 +1927,12 @@ do_sub_manage() {
             echo "  本地订阅:     ${lcnt} 个优选地址 (更新于 ${ltime})"
         fi
         echo
-        echo "  1. 立即拉取优选 IP 并生成本地订阅"
+        echo "  1. 立即拉取优选 IP 并导出节点文件"
         echo "  2. 管理优选 IP 列表链接"
         echo "  3. 切换优选端口过滤策略"
         echo "  4. 更换远程订阅服务 URL 与密钥"
         echo "  5. 固化/更新快捷命令 x"
-        echo "  6. 安装/更新 VPS 直连订阅服务"
+        echo "  6. 安装/更新直连订阅服务"
         echo "  0. 返回主菜单"
         echo
 

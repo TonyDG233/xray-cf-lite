@@ -17,7 +17,7 @@
 
 ## 关键状态文件
 
-- `/etc/xray-cf-lite/state.json`（600）：`domain` `zone_id` `uuid` `short_id` `net_mode` `routes[]`（`protocol`/`listen_port`/`cf_port`/`path`）`managed_dns_record_id` `dns_backup` `ssl_backup` `origin_rules_backup` `security_backup` `links{}` `sub_base` `sub_token` `port_mode` `ip_urls[]` `local_sub_count` `local_sub_updated_at`
+- `/etc/xray-cf-lite/state.json`（600）：`domain` `zone_id` `uuid` `short_id` `net_mode` `routes[]`（`protocol`/`listen_port`/`cf_port`/`path`）`managed_dns_record_id` `dns_backup` `ssl_backup` `origin_rules_backup` `security_backup` `links{}` `sub_base` `sub_token` `port_mode` `ip_urls[]` `local_sub_count` `local_sub_updated_at` `local_sub_url`
 - `/etc/xray-cf-lite/cf_account.json`（600）：`email` `api_key`
 - `/etc/xray-cf-lite/local_sub/`（700）：`nodes_all.txt` `sub_all_base64.txt` `nodes_<proto>.txt` `sub_<proto>_base64.txt`
 - `./cf_lite_last_links.txt`（600）：订阅链接快照
