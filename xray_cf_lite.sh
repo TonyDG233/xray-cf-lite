@@ -1759,7 +1759,7 @@ write_shortcut_remote() {
     local qurl
     qurl=$(printf '%q' "$url")
     {
-        printf '#!/bin/sh\n'
+        printf '#!/bin/bash\n'
         printf 'exec bash <(curl -fsSL %s) "$@"\n' "$qurl"
     } > "$SHORTCUT_PATH"
     chmod +x "$SHORTCUT_PATH"
@@ -1784,7 +1784,7 @@ write_shortcut_local() {
     local qpath
     qpath=$(printf '%q' "$LOCAL_SCRIPT_PATH")
     {
-        printf '#!/bin/sh\n'
+        printf '#!/bin/bash\n'
         printf 'exec bash %s "$@"\n' "$qpath"
     } > "$SHORTCUT_PATH"
     chmod +x "$SHORTCUT_PATH"
@@ -2144,7 +2144,7 @@ ensure_shortcut() {
     if [[ -f "$target" ]]; then
         if grep -q "byJoey/xray-cf-lite" "$target" 2>/dev/null; then
             {
-                printf '#!/bin/sh\n'
+                printf '#!/bin/bash\n'
                 printf 'exec bash <(curl -fsSL %s) "$@"\n' "$qurl"
             } > "$target"
             chmod +x "$target"
@@ -2153,7 +2153,7 @@ ensure_shortcut() {
         return
     fi
     {
-        printf '#!/bin/sh\n'
+        printf '#!/bin/bash\n'
         printf 'exec bash <(curl -fsSL %s) "$@"\n' "$qurl"
     } > "$target"
     chmod +x "$target"
