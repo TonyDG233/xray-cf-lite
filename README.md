@@ -72,30 +72,21 @@ x
 9. 订阅与优选 IP 管理  免 CF Key 管理优选 IP 源、端口策略、本地生成节点文件、远程订阅地址与快捷命令 x
 ```
 
-## 部署订阅服务（Cloudflare Worker）
+## 订阅（全在服务器上完成）
 
-脚本内置多个优选 IP 源，默认使用 Cloudflare 全部 TLS 端口，可切换为仅 443。订阅链接由这个服务生成，部署在你自己的 Cloudflare 账号，免费。
+1. 服务器运行 `x`，进 `9`，选 `6`
+2. 脚本会自己下载订阅服务、注册开机自启并启动，然后打印一个地址，形如 `http://服务器IP:18080/<密钥>/sub`
+3. 把这个地址填进客户端，更新订阅
 
-1. 打开 Cloudflare Dashboard -> Workers & Pages -> Create -> Worker，随便起个名字（如 `cflite-sub`），点 Deploy
-2. 点 Edit code，删掉编辑器里的默认代码，粘贴仓库中 `cf_sub_worker.js` 的全部内容，点 Deploy
-3. 记下页面上的地址，形如 `https://cflite-sub.你的子域.workers.dev`
-4. 回服务器运行 `x`，进 `9` -> `4`：
-   - 订阅服务 URL 填第 3 步的地址
-   - 访问密钥输入 `auto`，脚本会自动生成一串并打印出来，记下它
-5. 回 Cloudflare，进这个 Worker 的 Settings -> Variables and Secrets，添加变量 `TOKEN`，值填第 4 步打印的那串，保存后重新 Deploy
+以后改优选源或端口策略：`9` → `2` / `3`，客户端再点一次「更新订阅」，**地址不用换**。
 
-完成后，把脚本打印的订阅链接贴进客户端（安装时选三个协议就是三条），之后点「更新订阅」即可拿到最新优选 IP。
+> 客户端连不上时，先确认云厂商安全组和本机防火墙放行了该端口。
 
-> 未设置 `TOKEN` 时订阅地址对公网开放，任何人拿到都能用，建议按第 5 步设置。
-> 若 `workers.dev` 在你所在网络打不开，可给 Worker 绑定自己的域名，或在客户端开启「通过代理更新订阅」。
+## 可选：用 Cloudflare Worker 做订阅
 
-## VPS 直连订阅（断网兜底）
-
-- 把仓库里的订阅脚本上传到服务器，例如 `/root/local_sub_server.py`
-- 参照 `local_sub_server.service.example` 配置 systemd 服务并启动
-- 订阅地址形如 `http://服务器IP:18080/<密钥>/sub`
-- 密钥在 `x` 的 `9` -> `4` 中设置，也可在启动服务时单独指定
-- 改优选源只需 `x` -> `9` -> `2` / `3`，客户端重新拉一次即可，链接不变
+1. 登录 Cloudflare 后台，新建一个 Worker，把仓库里的 `cf_sub_worker.js` 全部粘贴进去并部署。
+2. 运行 `x` 进 `9` → `4`，填上 Worker 地址，密钥输入 `auto` 生成一串。
+3. 回 Cloudflare 给这个 Worker 添加名为 `TOKEN` 的变量，值填刚才那串，重新部署。
 
 ## 手动导入节点
 

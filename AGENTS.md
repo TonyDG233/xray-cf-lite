@@ -78,3 +78,7 @@
 - `local_sub_server.py`：仅标准库、每请求重读 state.json；默认端口 18080；token 取 state.sub_token，缺省用 `--token` / `LOCAL_SUB_TOKEN`
 - 端点按源列表元组缓存，TTL 300s，端口过滤在渲染时执行；`local_sub_server.service.example` 为 systemd 模板
 - Worker 的 `?ip_urls=` 在鉴权通过后生效（仅 https、过 `isSafeSourceUrl`、上限 32），非空时覆盖 env.IP_URLS 与默认源
+
+## 一键订阅服务
+- `install_local_sub_server`：菜单 9→6，装 python3、下载/复制 py、写 systemd/OpenRC、启动、自检并打印订阅地址
+- 端口存 `sub_serve_port`（缺省 18080），服务名 `cflite-sub`；测试用 `XRAY_CF_LITE_SYSTEMD_DIR` / `XRAY_CF_LITE_INITD_DIR` / `XRAY_CF_LITE_SKIP_SERVICE=1` 重定向并跳过 systemctl/rc-*

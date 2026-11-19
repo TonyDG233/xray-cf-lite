@@ -13,6 +13,11 @@ LOCAL_SCRIPT_PATH="$STATE_DIR/xray_cf_lite.sh"
 LAST_LINKS_PATH="${XRAY_CF_LITE_LAST_LINKS_PATH:-$(pwd)/cf_lite_last_links.txt}"
 SHORTCUT_PATH="${XRAY_CF_LITE_SHORTCUT_PATH:-/usr/local/bin/x}"
 SCRIPT_RAW_URL="${XRAY_CF_LITE_RAW_URL:-https://raw.githubusercontent.com/TonyDG233/xray-cf-lite/main/xray_cf_lite.sh}"
+LOCAL_SUB_PY="$STATE_DIR/local_sub_server.py"
+LOCAL_SUB_SERVICE="${LOCAL_SUB_SERVICE:-cflite-sub}"
+SYSTEMD_DIR="${XRAY_CF_LITE_SYSTEMD_DIR:-/etc/systemd/system}"
+INITD_DIR="${XRAY_CF_LITE_INITD_DIR:-/etc/init.d}"
+SKIP_SERVICE="${XRAY_CF_LITE_SKIP_SERVICE:-0}"
 
 CF_API="https://api.cloudflare.com/client/v4"
 MANAGED_PREFIX="xray-cf-lite "
@@ -1403,11 +1408,12 @@ do_uninstall() {
         echo "无 CF 凭据，跳过恢复"
     fi
 
+    local_sub_cleanup
     remove_state
     rm -f "$LAST_LINKS_PATH" "$CF_ACCOUNT_PATH"
     rm -rf "$LOCAL_SUB_DIR"
     rm -f "$LOCAL_SCRIPT_PATH"
-    ok "已清理订阅快照、本地优选订阅、CF 凭据与本地离线脚本"
+    ok "已清理订阅快照、本地优选订阅、CF 凭据、直连订阅服务与本地离线脚本"
     ok "卸载完成"
 }
 
@@ -1785,6 +1791,100 @@ write_shortcut_local() {
     ok "已固化为本地离线脚本 ($SHORTCUT_PATH -> $LOCAL_SCRIPT_PATH)"
 }
 
+# ── VPS 直连订阅服务（一键安装）─────────────────────
+_port_in_use() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+
+local_sub_server_active() {
+    [[ "$SKIP_SERVICE" == "1" ]] && return 1
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl is-active --quiet "$LOCAL_SUB_SERVICE" &>/dev/null
+    else rc-service "$LOCAL_SUB_SERVICE" status &>/dev/null 2>&1; fi
+}
+
+local_sub_cleanup() {
+    local unit="$SYSTEMD_DIR/$LOCAL_SUB_SERVICE.service" initf="$INITD_DIR/$LOCAL_SUB_SERVICE"
+    if [[ "$SKIP_SERVICE" != "1" ]]; then
+        [[ -f "$unit" ]] && systemctl disable --now "$LOCAL_SUB_SERVICE" &>/dev/null || true
+        if [[ -f "$initf" ]]; then
+            rc-service "$LOCAL_SUB_SERVICE" stop &>/dev/null || true
+            rc-update del "$LOCAL_SUB_SERVICE" default &>/dev/null || true
+        fi
+        [[ -f "$unit" ]] && systemctl daemon-reload &>/dev/null || true
+    fi
+    rm -f "$unit" "$initf" "$LOCAL_SUB_PY"
+}
+
+install_local_sub_server() {
+    if ! command -v python3 &>/dev/null; then
+        info "未检测到 python3，尝试自动安装..."
+        if command -v apk &>/dev/null; then apk add --no-cache python3
+        elif command -v apt-get &>/dev/null; then apt-get update -qq && apt-get install -y -qq python3
+        elif command -v yum &>/dev/null; then yum install -y python3
+        else die "缺少 python3 且未识别包管理器，请手动安装 python3"; fi
+        command -v python3 &>/dev/null || die "python3 自动安装失败，请手动安装后重试"
+    fi
+    local pybin; pybin=$(command -v python3)
+
+    local state; state=$(load_state 2>/dev/null || true)
+    [[ -n "$state" ]] || die "未检测到已部署节点，请先在主菜单执行 [1. 安装节点]"
+    ensure_sub_token_present "$state"
+    state=$(load_state)
+
+    mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
+    local tmp src; tmp=$(mktemp)
+    curl -fsSL --max-time 20 "${SCRIPT_RAW_URL%/*}/local_sub_server.py" -o "$tmp" 2>/dev/null || true
+    [[ -s "$tmp" ]] || { src="${BASH_SOURCE[0]:-}"; cp "${src%/*}/local_sub_server.py" "$tmp" 2>/dev/null || true; }
+    [[ -s "$tmp" ]] && head -n1 "$tmp" | grep -q python3 || { rm -f "$tmp"; die "local_sub_server.py 获取或校验失败"; }
+    cp "$tmp" "$LOCAL_SUB_PY" && chmod 700 "$LOCAL_SUB_PY"; rm -f "$tmp"
+
+    local port; port=$(echo "$state" | jq -r '.sub_serve_port // 18080' | tr -d '\r')
+    [[ "$port" =~ ^[0-9]+$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) || port=18080
+    while _port_in_use "$port"; do
+        info "端口 $port 已被占用"
+        local np=""; read -rp "请输入新端口 (1-65535): " np || die "已取消"
+        [[ "$np" =~ ^[0-9]+$ ]] && (( 10#$np >= 1 && 10#$np <= 65535 )) || { info "无效端口: $np"; continue; }
+        port=$((10#$np))
+    done
+    state=$(echo "$state" | jq --argjson p "$port" '.sub_serve_port = $p'); save_state "$state"
+
+    local unit="$SYSTEMD_DIR/$LOCAL_SUB_SERVICE.service" initf="$INITD_DIR/$LOCAL_SUB_SERVICE"
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        mkdir -p "$SYSTEMD_DIR"
+        cat > "$unit" <<EOF
+[Unit]
+Description=xray-cf-lite local subscription server
+After=network.target
+[Service]
+ExecStart=$pybin $LOCAL_SUB_PY --port $port --state $STATE_PATH
+Restart=always
+RestartSec=2
+[Install]
+WantedBy=multi-user.target
+EOF
+        [[ "$SKIP_SERVICE" == "1" ]] || { systemctl daemon-reload; systemctl enable --now "$LOCAL_SUB_SERVICE"; }
+    else
+        mkdir -p "$INITD_DIR"
+        cat > "$initf" <<EOF
+#!/sbin/openrc-run
+name="$LOCAL_SUB_SERVICE"
+command="$pybin"
+command_args="$LOCAL_SUB_PY --port $port --state $STATE_PATH"
+supervisor="supervise-daemon"
+respawn_delay=2
+respawn_max=0
+EOF
+        chmod +x "$initf"
+        [[ "$SKIP_SERVICE" == "1" ]] || { rc-update add "$LOCAL_SUB_SERVICE" default; rc-service "$LOCAL_SUB_SERVICE" start; }
+    fi
+
+    local token; token=$(echo "$state" | jq -r '.sub_token // ""' | tr -d '\r')
+    local pub="${XRAY_CF_LITE_PUBLIC_IP:-}"; [[ -n "$pub" ]] || pub=$(get_public_ip 2>/dev/null || true)
+    [[ -n "$pub" ]] || pub="<服务器公网IP>"
+    [[ "$SKIP_SERVICE" == "1" ]] || { curl -fsS --max-time 5 "http://127.0.0.1:${port}/${token}/sub" -o /dev/null 2>/dev/null && ok "本机自检通过" || info "服务已写入但本机自检失败，请查看 journalctl -u $LOCAL_SUB_SERVICE"; }
+    echo "订阅服务已启动"
+    echo "订阅地址: http://${pub}:${port}/${token}/sub"
+    info "若客户端连不上，请确认云安全组与本机防火墙已放行该端口"
+}
+
 do_sub_manage() {
     while true; do
         local state=""
@@ -1800,6 +1900,16 @@ do_sub_manage() {
         echo
         echo "── 订阅与优选 IP 管理 (免 CF Key) ──────────────"
         echo "  远程订阅服务: $sub_base${sub_token:+ (已设置密钥)}"
+        local sub_port sub_tok
+        sub_port=$(echo "$state" | jq -r '.sub_serve_port // 18080' 2>/dev/null | tr -d '\r')
+        [[ "$sub_port" =~ ^[0-9]+$ ]] || sub_port=18080
+        sub_tok=$(echo "$state" | jq -r '.sub_token // ""' 2>/dev/null | tr -d '\r' || true)
+        if local_sub_server_active; then
+            local sub_ip="${XRAY_CF_LITE_PUBLIC_IP:-$(get_public_ip 2>/dev/null || true)}"
+            echo "  直连订阅:     http://${sub_ip:-<公网IP>}:${sub_port}/${sub_tok}/sub"
+        else
+            echo "  直连订阅:     未启用（选 6 安装）"
+        fi
         echo "  优选 IP 源:   ${ip_count} 个"
         echo "  端口策略:     $port_label"
         if [[ -n "$state" && -f "$LOCAL_SUB_DIR/sub_all_base64.txt" ]]; then
@@ -1814,11 +1924,12 @@ do_sub_manage() {
         echo "  3. 切换优选端口过滤策略"
         echo "  4. 更换远程订阅服务 URL 与密钥"
         echo "  5. 固化/更新快捷命令 x"
+        echo "  6. 安装/更新 VPS 直连订阅服务"
         echo "  0. 返回主菜单"
         echo
 
         local sub_choice=""
-        read -rp "请选择 [0-5]: " sub_choice || break
+        read -rp "请选择 [0-6]: " sub_choice || break
         case "$sub_choice" in
             1)
                 if [[ -z "$state" ]]; then
@@ -2006,6 +2117,9 @@ do_sub_manage() {
                     0|"") ;;
                     *) info "无效选项: $sc_choice" ;;
                 esac
+                ;;
+            6)
+                install_local_sub_server
                 ;;
             0)
                 return 0
